@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import serial; print\\(serial.__version__\\)\")",
+      "Bash(python -m py_compile FFT.py)",
+      "Bash(python FFT.py --help)",
+      "Read(//c/Users/temz/.platformio/packages/framework-espidf/components/hal/esp32s3/include/hal/**)",
+      "Read(//c/Users/temz/.platformio/packages/framework-espidf/components/hal/**)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 60)",
+      "Bash(grep -rn \"SOC_ADC_SAMPLE_FREQ_THRES\" \"C:/Users/temz/.platformio/packages/framework-espidf/components/soc/esp32s3/include/soc/soc_caps.h\" 2>/dev/null)",
+      "Read(//c/Users/temz/.platformio/packages/framework-espidf/components/soc/esp32s3/include/soc/**)",
+      "Bash(python -c \"import serial.tools.list_ports as lp; print\\([ \\(p.device, p.description\\) for p in lp.comports\\(\\)]\\)\")",
+      "Bash(python -c \"import tkinter; print\\('tkinter OK', tkinter.TkVersion\\)\")",
+      "Bash(python -c ' *)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 40)"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"$HOME/.platformio/packages/framework-espidf\" -iname \"adc_continuous.h\" 2>/dev/null)",
+      "Read(//c/Users/temz/.platformio/packages/framework-espidf/**)",
+      "PowerShell(Get-ChildItem -Path \"$env:USERPROFILE\\\\.platformio\\\\packages\\\\framework-espidf\" -Recurse -Filter \"adc_continuous.h\" -ErrorAction SilentlyContinue | Select-Object -First 5 FullName)",
+      "Read(//c/Users/temz/.platformio/packages/framework-espidf/components/esp_adc/**)"
+    ]
+  }
+}
