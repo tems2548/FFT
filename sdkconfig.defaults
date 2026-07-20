@@ -1,0 +1,14 @@
+# Console UART baud, raised from the default 115200 so the ADC data
+# stream (see main.c's TARGET_OUTPUT_RATE_HZ / STREAM_UART_PORT comments)
+# has enough throughput. FFT.py's --baud must match this.
+#
+# CONFIG_ESP_CONSOLE_UART_BAUDRATE's Kconfig prompt is only active under
+# "Custom UART" (ESP_CONSOLE_UART_CUSTOM) -- under the default "UART0"
+# choice its value is ignored and silently reset to 115200 no matter what
+# this file or the generated sdkconfig say. Selecting Custom here still
+# defaults to UART0 on GPIO43/44, the same pins/port already wired to the
+# board's USB-serial bridge, so nothing else about the console changes.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=3000000
+CONFIG_ESPTOOLPY_MONITOR_BAUD=3000000

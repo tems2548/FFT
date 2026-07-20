@@ -15,7 +15,7 @@ main.c, which streams decimated ADC samples over the same USB-UART used
 for flashing/logging):
     python FFT.py --serial              # pick the port from a GUI list
     python FFT.py --serial COM5
-    python FFT.py --serial /dev/ttyUSB0 --baud 115200
+    python FFT.py --serial /dev/ttyUSB0 --baud 3000000
 """
 import argparse
 import csv
@@ -41,6 +41,35 @@ SPECTROGRAM_HISTORY = 120
 
 MAGIC_META = b"META"
 MAGIC_DATA = b"DATA"
+
+
+def _cosine_sum_window(n, coeffs):
+    """Generic cosine-sum window: coeffs[0] - coeffs[1]*cos(2*pi*k/(n-1)) +
+    coeffs[2]*cos(4*pi*k/(n-1)) - ... Covers Hann/Hamming/Blackman/
+    Blackman-Harris/flat-top, which are all members of this family."""
+    k = np.arange(n)
+    w = np.zeros(n)
+    for i, c in enumerate(coeffs):
+        sign = -1.0 if i % 2 else 1.0
+        w += sign * c * np.cos(2 * np.pi * i * k / (n - 1))
+    return w
+
+
+# Each window trades frequency resolution (narrow main lobe) against
+# amplitude/SFDR accuracy (low sidelobes, wide main lobe) differently:
+# Rectangular has the narrowest main lobe but leaks badly; flat-top has a
+# very wide main lobe but the flattest passband, so it's the standard
+# choice when you need an accurate amplitude reading rather than to
+# resolve closely-spaced tones. Coefficients match scipy.signal.windows
+# so results are the same as elsewhere without adding a scipy dependency.
+WINDOW_FUNCTIONS = {
+    "Hann": lambda n: np.hanning(n),
+    "Hamming": lambda n: np.hamming(n),
+    "Blackman": lambda n: np.blackman(n),
+    "Blackman-Harris": lambda n: _cosine_sum_window(n, [0.35875, 0.48829, 0.14128, 0.01168]),
+    "Flat-top": lambda n: _cosine_sum_window(n, [0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368]),
+    "Rectangular": lambda n: np.ones(n),
+}
 
 
 class SerialReader:
@@ -349,13 +378,91 @@ def find_harmonics(mag_db, fundamental_bin, window_size, fs, max_harmonic=5, sea
     return results
 
 
+def find_second_peak(mag_db, primary_idx, window_size, fs, exclude_radius=2):
+    """Locate the second-strongest independent spectral component, with
+    sub-bin accuracy — for multi-tone signals where a second tone isn't
+    harmonically related to the first (an arbitrary frequency, unlike
+    find_harmonic which only searches near integer multiples of the
+    fundamental). DC and the primary peak's own bins are excluded.
+
+    Returns (freq, db, idx), or None if nothing else is present.
+    """
+    n = len(mag_db)
+    mask = np.ones(n, dtype=bool)
+    mask[0] = False
+    lo, hi = max(0, primary_idx - exclude_radius), min(n, primary_idx + exclude_radius + 1)
+    mask[lo:hi] = False
+    if not mask.any():
+        return None
+    masked_positions = np.flatnonzero(mask)
+    idx = int(masked_positions[np.argmax(mag_db[mask])])
+    peak_bin, peak_val = parabolic_interpolation(mag_db, idx)
+    freq = peak_bin * fs / window_size
+    return freq, peak_val, idx
+
+
+def compute_sfdr(mag_db, peak_idx, window_size, fs, exclude_radius=2):
+    """Spurious-Free Dynamic Range: dB gap between the fundamental peak and
+    the next-largest spectral component (DC and the fundamental's own bins
+    excluded) — how far the signal sits above its worst spur, whether
+    that spur is a harmonic, an unrelated second tone, or noise.
+    """
+    second = find_second_peak(mag_db, peak_idx, window_size, fs, exclude_radius)
+    if second is None:
+        return np.inf
+    _freq, spur_db, _idx = second
+    return mag_db[peak_idx] - spur_db
+
+
+def compute_time_domain_stats(buffer):
+    """Peak-to-peak amplitude, RMS, and crest factor (zero-to-peak / RMS —
+    how "peaky" the waveform is; ~1.41 for a sine, higher for impulsive
+    signals) of the current time-domain window."""
+    amplitude_pp = buffer.max() - buffer.min()
+    rms = float(np.sqrt(np.mean(buffer ** 2)))
+    peak = float(np.max(np.abs(buffer)))
+    crest_factor = peak / rms if rms > 0 else np.inf
+    return amplitude_pp, rms, crest_factor
+
+
+def compute_sinad(mag, peak_idx, exclude_radius=2):
+    """Signal-to-Noise-and-Distortion: fundamental power vs. everything else
+    in the spectrum (noise floor AND harmonics together), unlike SNR which
+    excludes harmonics. This is what ENOB is derived from.
+    """
+    power = mag ** 2
+    n = len(power)
+    mask = np.ones(n, dtype=bool)
+    mask[0] = False  # DC
+    lo, hi = max(0, peak_idx - exclude_radius), min(n, peak_idx + exclude_radius + 1)
+    mask[lo:hi] = False  # fundamental itself
+    signal_power = power[peak_idx]
+    noise_and_distortion_power = power[mask].sum()
+    return 10 * np.log10(signal_power / max(noise_and_distortion_power, 1e-20))
+
+
+def compute_enob(sinad_db):
+    """Effective Number of Bits: the standard SINAD -> ENOB conversion used
+    to characterize real-world ADC resolution."""
+    return (sinad_db - 1.76) / 6.02
+
+
 def compute_thd(mag, peak_idx, harmonics):
     """Total Harmonic Distortion: RMS of the given harmonics relative to
     the fundamental amplitude, as a percentage and in dB.
 
     Takes the harmonics dict from find_harmonics rather than searching
     again, so THD stays consistent with the on-screen readings for free.
+
+    Returns (None, None) if harmonics is empty. This happens once the
+    fundamental is high enough that even the 2nd harmonic falls above
+    Nyquist (fs/2) -- there's no harmonic content left in the sampled band
+    to measure at all, a hard physical limit of FFT analysis, not a bug.
+    Reporting 0% in that case would misleadingly claim a verified-clean
+    signal instead of "couldn't be measured".
     """
+    if not harmonics:
+        return None, None
     fundamental_mag = mag[peak_idx]
     if fundamental_mag <= 0:
         return 0.0, -np.inf
@@ -374,11 +481,18 @@ def save_snapshot_csv(
     db,
     peak_freq,
     peak_db,
-    harmonic_freq,
-    harmonic_db,
+    harmonics,
+    second_peak,
     snr_db,
     noise_floor_db,
     thd_percent,
+    sfdr_db,
+    amplitude_pp,
+    rms,
+    crest_factor,
+    dc_bias,
+    sinad_db,
+    enob,
 ):
     """Write the current time/frequency snapshot plus summary stats to CSV."""
     fname = f"fft_snapshot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -386,11 +500,26 @@ def save_snapshot_csv(
         writer = csv.writer(f)
         writer.writerow(["# peak_freq_hz", f"{peak_freq:.4f}"])
         writer.writerow(["# peak_db", f"{peak_db:.2f}"])
-        writer.writerow(["# harmonic2_freq_hz", f"{harmonic_freq:.4f}" if harmonic_freq is not None else ""])
-        writer.writerow(["# harmonic2_db", f"{harmonic_db:.2f}" if harmonic_db is not None else ""])
+        if second_peak is not None:
+            second_freq, second_db, _idx = second_peak
+            writer.writerow(["# second_peak_freq_hz", f"{second_freq:.4f}"])
+            writer.writerow(["# second_peak_db", f"{second_db:.2f}"])
+        else:
+            writer.writerow(["# second_peak_freq_hz", ""])
+            writer.writerow(["# second_peak_db", ""])
+        for h, (h_freq, h_db, _idx) in sorted(harmonics.items()):
+            writer.writerow([f"# harmonic{h}_freq_hz", f"{h_freq:.4f}"])
+            writer.writerow([f"# harmonic{h}_db", f"{h_db:.2f}"])
+        writer.writerow(["# dc_bias", f"{dc_bias:.4f}"])
+        writer.writerow(["# amplitude_pp", f"{amplitude_pp:.4f}"])
+        writer.writerow(["# rms", f"{rms:.4f}"])
+        writer.writerow(["# crest_factor", f"{crest_factor:.3f}"])
         writer.writerow(["# snr_db", f"{snr_db:.2f}"])
+        writer.writerow(["# sinad_db", f"{sinad_db:.2f}"])
+        writer.writerow(["# enob_bits", f"{enob:.2f}"])
         writer.writerow(["# noise_floor_db", f"{noise_floor_db:.2f}"])
-        writer.writerow(["# thd_percent", f"{thd_percent:.3f}"])
+        writer.writerow(["# thd_percent", f"{thd_percent:.3f}" if thd_percent is not None else ""])
+        writer.writerow(["# sfdr_db", f"{sfdr_db:.2f}"])
         writer.writerow([])
         writer.writerow(["time_s", "amplitude", "freq_hz", "magnitude", "magnitude_db"])
         for row in itertools.zip_longest(t_axis, buffer, freqs, mag, db, fillvalue=""):
@@ -474,8 +603,10 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.window_size = args.window
         self.samples_per_frame = max(1, int(fs / args.fps))
         self.buffer = np.zeros(self.window_size)
-        self.hann = np.hanning(self.window_size)
-        self.mag_scale = 2.0 / np.sum(self.hann)
+        self.window_name = args.fft_window
+        self.window_func = None
+        self.mag_scale = None
+        self._recompute_window()
         self.t_axis = np.linspace(0, self.window_size / fs, self.window_size, endpoint=False)
         self.freqs = np.fft.rfftfreq(self.window_size, d=1 / fs)
 
@@ -494,6 +625,16 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.last_frame_time = None
         self.last_snapshot = None
 
+        # Power-domain exponential averaging of the spectrum (like a real
+        # analyzer's "trace averaging"), so the displayed curve and all the
+        # readings derived from it settle down instead of jumping every
+        # frame -- especially needed at high sample rates, where each
+        # window covers a short, disjoint (non-overlapping) slice of
+        # signal. Averaging happens in power (mag**2), not dB, since
+        # averaging logs is statistically biased.
+        self.spectrum_alpha = 1.0 - args.averaging / 100.0
+        self.power_avg = None
+
         title = f"FFT Test Bench — Live ESP32 ADC ({port_label} @ {fs:.0f} Hz)" if live else "FFT Test Bench"
         self.setWindowTitle(title)
         self._build_ui(title)
@@ -501,6 +642,14 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(int(1000 / args.fps))
+
+    def _recompute_window(self):
+        self.window_func = WINDOW_FUNCTIONS[self.window_name](self.window_size)
+        self.mag_scale = 2.0 / np.sum(self.window_func)
+        # A different window changes the spectrum's scale/shape, so blending
+        # it into the old running average would produce a misleading
+        # transient; just restart averaging from the next frame instead.
+        self.power_avg = None
 
     # -- UI construction -----------------------------------------------
 
@@ -511,14 +660,22 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
-        root.addWidget(self._build_sidebar(title), 0)
+        # More sections (Signal / Harmonics / Quality) than fit in a fixed
+        # 260px-tall column at some window sizes, so scroll rather than
+        # clip or squeeze the plots to make room.
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(280)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(self._build_sidebar(title))
+        root.addWidget(scroll, 0)
         root.addWidget(self._build_plots(), 1)
 
-        self.resize(1280, 900)
+        self.resize(1320, 900)
 
     def _build_sidebar(self, title):
         panel = QtWidgets.QWidget()
-        panel.setFixedWidth(260)
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setSpacing(14)
 
@@ -526,6 +683,37 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         mode_label.setObjectName("modeLabel")
         mode_label.setWordWrap(True)
         layout.addWidget(mode_label)
+
+        window_title = QtWidgets.QLabel("FFT Window")
+        window_title.setObjectName("sectionTitle")
+        layout.addWidget(window_title)
+        self.window_combo = QtWidgets.QComboBox()
+        self.window_combo.addItems(list(WINDOW_FUNCTIONS.keys()))
+        self.window_combo.setCurrentText(self.window_name)
+        self.window_combo.currentTextChanged.connect(self._on_window_change)
+        layout.addWidget(self.window_combo)
+        window_hint = QtWidgets.QLabel(
+            "Narrow lobe (Rectangular/Hann) resolves close tones; wide lobe\n"
+            "(Flat-top) gives the most accurate amplitude/SFDR reading."
+        )
+        window_hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        window_hint.setWordWrap(True)
+        layout.addWidget(window_hint)
+
+        self.averaging_label = QtWidgets.QLabel(f"Averaging: {self.args.averaging:.0f}%")
+        layout.addWidget(self.averaging_label)
+        self.averaging_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.averaging_slider.setRange(0, 99)
+        self.averaging_slider.setValue(int(self.args.averaging))
+        self.averaging_slider.valueChanged.connect(self._on_averaging_change)
+        layout.addWidget(self.averaging_slider)
+        averaging_hint = QtWidgets.QLabel(
+            "Smooths the spectrum trace and readings across frames — raise\n"
+            "this if the display looks jumpy (common at high sample rates)."
+        )
+        averaging_hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        averaging_hint.setWordWrap(True)
+        layout.addWidget(averaging_hint)
 
         wave_title = QtWidgets.QLabel("Waveform")
         wave_title.setObjectName("sectionTitle")
@@ -571,17 +759,26 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.save_status_label.setStyleSheet(f"color: {ACCENT_OK};")
         layout.addWidget(self.save_status_label)
 
-        layout.addSpacing(6)
-        stats_title = QtWidgets.QLabel("Readings")
-        stats_title.setObjectName("sectionTitle")
-        layout.addWidget(stats_title)
-        self.stats_label = QtWidgets.QLabel("—")
-        self.stats_label.setObjectName("statsLabel")
-        self.stats_label.setWordWrap(True)
-        layout.addWidget(self.stats_label)
+        self.fps_label = QtWidgets.QLabel("")
+        self.fps_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        layout.addWidget(self.fps_label)
+
+        self.signal_label = self._add_stats_section(layout, "Signal")
+        self.harmonics_label = self._add_stats_section(layout, "Harmonics")
+        self.quality_label = self._add_stats_section(layout, "Signal Quality")
 
         layout.addStretch(1)
         return panel
+
+    def _add_stats_section(self, layout, title):
+        section_title = QtWidgets.QLabel(title)
+        section_title.setObjectName("sectionTitle")
+        layout.addWidget(section_title)
+        label = QtWidgets.QLabel("—")
+        label.setObjectName("statsLabel")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        return label
 
     def _build_plots(self):
         pg.setConfigOptions(antialias=True)
@@ -611,6 +808,10 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.freq_plot.setYRange(-100, 20, padding=0)
         self.peak_marker = pg.ScatterPlotItem(size=9, brush=pg.mkBrush(ACCENT_FREQ), pen=pg.mkPen(TEXT_FG, width=1))
         self.freq_plot.addItem(self.peak_marker)
+        self.second_peak_marker = pg.ScatterPlotItem(
+            size=9, symbol="t", brush=pg.mkBrush(ACCENT_SNR), pen=pg.mkPen(TEXT_FG, width=1)
+        )
+        self.freq_plot.addItem(self.second_peak_marker)
         self._add_crosshair(self.freq_plot, "Hz", "dB")
         vbox.addWidget(self.freq_plot, 1)
 
@@ -681,6 +882,14 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
 
     # -- Control callbacks ------------------------------------------------
 
+    def _on_window_change(self, text):
+        self.window_name = text
+        self._recompute_window()
+
+    def _on_averaging_change(self, value):
+        self.spectrum_alpha = 1.0 - value / 100.0
+        self.averaging_label.setText(f"Averaging: {value}%")
+
     def _on_wave_change(self, text):
         self.wave = text
 
@@ -734,30 +943,79 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         # end), which would otherwise dominate the display and leak into
         # nearby FFT bins through the Hann window's sidelobes. Removing the
         # window's mean AC-couples it in software.
-        display_buffer = self.buffer - self.buffer.mean() if self.live else self.buffer
+        dc_bias = self.buffer.mean()
+        display_buffer = self.buffer - dc_bias if self.live else self.buffer
         self.time_curve.setData(self.t_axis, display_buffer)
 
-        spectrum = np.fft.rfft(display_buffer * self.hann)
-        mag = np.abs(spectrum) * self.mag_scale
+        spectrum = np.fft.rfft(display_buffer * self.window_func)
+        mag_instant = np.abs(spectrum) * self.mag_scale
+        power_instant = mag_instant ** 2
+        if self.power_avg is None:
+            self.power_avg = power_instant
+        else:
+            self.power_avg += self.spectrum_alpha * (power_instant - self.power_avg)
+        mag = np.sqrt(self.power_avg)
         db = 20 * np.log10(mag + 1e-12)
         self.freq_curve.setData(self.freqs, db)
 
         peak_freq, peak_db, peak_idx = find_peak(db, self.window_size, self.fs)
         harmonics = find_harmonics(db, peak_idx, self.window_size, self.fs, max_harmonic=5)
         harmonic2 = harmonics.get(2)
-        harmonic_freq, harmonic_db, harmonic_idx = harmonic2 if harmonic2 else (None, None, None)
+        harmonic_idx = harmonic2[2] if harmonic2 else None
         snr_db, noise_floor_db = compute_snr(mag, peak_idx, harmonic_idx)
         thd_percent, _thd_db = compute_thd(mag, peak_idx, harmonics)
+        second_peak = find_second_peak(db, peak_idx, self.window_size, self.fs)
+        sfdr_db = compute_sfdr(db, peak_idx, self.window_size, self.fs)
+        amplitude_pp, rms, crest_factor = compute_time_domain_stats(display_buffer)
+        sinad_db = compute_sinad(mag, peak_idx)
+        enob = compute_enob(sinad_db)
         self.peak_marker.setData([peak_freq], [peak_db])
+        if second_peak is not None:
+            self.second_peak_marker.setData([second_peak[0]], [second_peak[1]])
+        else:
+            self.second_peak_marker.setData([], [])
 
-        stats_lines = [
-            f"FPS:      {self.fps:5.1f}",
-            f"Peak:     {peak_freq:8.2f} Hz  ({peak_db:6.1f} dB)",
-            "2nd harm: " + (f"{harmonic_freq:8.2f} Hz  ({harmonic_db:6.1f} dB)" if harmonic_freq is not None else "n/a"),
-            f"SNR:      {snr_db:6.1f} dB",
-            f"THD:      {thd_percent:6.2f} %",
-        ]
-        self.stats_label.setText("\n".join(stats_lines))
+        unit = "V" if self.live else ""
+        self.fps_label.setText(f"{self.fps:.1f} FPS")
+
+        if second_peak is not None:
+            second_freq, second_db, _idx = second_peak
+            second_line = f"2nd peak:  {second_freq:8.2f} Hz ({second_db:6.1f} dB)"
+        else:
+            second_line = "2nd peak:  n/a"
+
+        self.signal_label.setText(
+            "\n".join([
+                f"Peak:      {peak_freq:8.2f} Hz ({peak_db:6.1f} dB)",
+                second_line,
+                f"DC bias:   {dc_bias:7.3f} {unit}",
+                f"Amplitude: {amplitude_pp:7.3f} {unit}pp",
+                f"RMS:       {rms:7.3f} {unit}",
+                f"Crest fac: {crest_factor:7.2f}",
+            ])
+        )
+
+        harmonic_lines = []
+        for h in range(2, 6):
+            result = harmonics.get(h)
+            ordinal = {2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}[h]
+            if result is not None:
+                h_freq, h_db, _idx = result
+                harmonic_lines.append(f"{ordinal}: {h_freq:8.2f} Hz ({h_db:6.1f} dB)")
+            else:
+                harmonic_lines.append(f"{ordinal}: n/a")
+        self.harmonics_label.setText("\n".join(harmonic_lines))
+
+        thd_line = f"THD:   {thd_percent:6.2f} %" if thd_percent is not None else "THD:   n/a (fundamental too high -- harmonics exceed Nyquist)"
+        self.quality_label.setText(
+            "\n".join([
+                f"SNR:   {snr_db:6.1f} dB",
+                f"SINAD: {sinad_db:6.1f} dB",
+                f"ENOB:  {enob:6.2f} bits",
+                thd_line,
+                f"SFDR:  {sfdr_db:6.1f} dB",
+            ])
+        )
 
         self.spec_history[:-1] = self.spec_history[1:]
         self.spec_history[-1] = db
@@ -778,11 +1036,18 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
             db=db,
             peak_freq=peak_freq,
             peak_db=peak_db,
-            harmonic_freq=harmonic_freq,
-            harmonic_db=harmonic_db,
+            harmonics=harmonics,
+            second_peak=second_peak,
             snr_db=snr_db,
             noise_floor_db=noise_floor_db,
             thd_percent=thd_percent,
+            sfdr_db=sfdr_db,
+            amplitude_pp=amplitude_pp,
+            rms=rms,
+            crest_factor=crest_factor,
+            dc_bias=dc_bias,
+            sinad_db=sinad_db,
+            enob=enob,
         )
 
     def closeEvent(self, event):
@@ -799,8 +1064,22 @@ def main():
     p.add_argument("--sweep-period", type=float, default=8.0, help="chirp sweep period (s)")
     p.add_argument("--samplerate", type=float, default=2000.0, help="sample rate (Hz)")
     p.add_argument("--window", type=int, default=2048, help="FFT / display window size (samples)")
+    p.add_argument(
+        "--fft-window",
+        dest="fft_window",
+        choices=list(WINDOW_FUNCTIONS.keys()),
+        default="Hann",
+        help="FFT window function (also switchable live from the sidebar)",
+    )
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--noise", type=float, default=0.03, help="initial noise std dev")
+    p.add_argument(
+        "--averaging",
+        type=float,
+        default=70.0,
+        help="spectrum trace averaging, 0 (raw/instant) to ~99 (heavy smoothing); "
+        "also live-adjustable from the sidebar",
+    )
     p.add_argument(
         "--serial",
         nargs="?",
@@ -811,7 +1090,7 @@ def main():
         "Give a port directly (e.g. COM5, /dev/ttyUSB0), or pass --serial with no value "
         "to pick one from a GUI list.",
     )
-    p.add_argument("--baud", type=int, default=115200, help="serial baud rate for --serial")
+    p.add_argument("--baud", type=int, default=3000000, help="serial baud rate for --serial (must match CONFIG_ESP_CONSOLE_UART_BAUDRATE in main.c's sdkconfig)")
     args = p.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)

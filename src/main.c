@@ -12,16 +12,23 @@
 #include "esp_adc/adc_cali_scheme.h"
 
 #define TIMES 256
-#define SAMPLE_FREQ 32000 // 4 kHz sampling rate
+#define SAMPLE_FREQ 80000 // 4 kHz sampling rate
 #define READ_LEN 512      // Bytes to read per block
 #define EXAMPLE_ADC_UNIT ADC_UNIT_1
 #define EXAMPLE_ADC_CHAN ADC_CHANNEL_6 // ESP32-S3: GPIO7
 
 // Streaming to FFT.py over the same USB-UART used for logging/flashing.
-// Raw ADC samples are decimated (averaged) before being sent, since 80 kHz
-// of raw samples can't fit over UART at the default 115200 baud. Packets
-// are framed with an ASCII magic word so the Python side can resync even
-// if ESP_LOG lines land in the stream.
+// Raw ADC samples are decimated (averaged) before being sent. At
+// TARGET_OUTPUT_RATE_HZ this rate needs ~2*TARGET_OUTPUT_RATE_HZ bytes/sec
+// of UART throughput; the console UART baud was raised to 3,000,000 (see
+// CONFIG_ESP_CONSOLE_UART_BAUDRATE in sdkconfig.esp32-s3-devkitm-1, and
+// monitor_speed in platformio.ini) to comfortably fit that -- the default
+// 115200 baud only carries ~11,500 bytes/sec, nowhere near enough for
+// 80 kHz output and previously caused torn/dropped packets (a glitchy,
+// wrong-looking time-domain waveform) once decimation stopped rate-limiting
+// it. FFT.py must be pointed at the same baud via --baud (or the port
+// picker's baud field). Packets are framed with an ASCII magic word so the
+// Python side can resync even if ESP_LOG lines land in the stream.
 //
 // The ADC continuous driver's actual conversion rate doesn't reliably
 // match the sample_freq_hz configured on it (observed both ~2x over and
@@ -29,7 +36,7 @@
 // decimation factor, the firmware measures the real raw rate at startup
 // (see measure_actual_raw_sample_rate) and derives the decimation factor
 // needed to land close to TARGET_OUTPUT_RATE_HZ from that measurement.
-#define TARGET_OUTPUT_RATE_HZ 32000
+#define TARGET_OUTPUT_RATE_HZ 80000
 #define PACKET_SAMPLES 128
 #define STREAM_UART_PORT UART_NUM_0
 
