@@ -12,7 +12,7 @@
 #include "esp_adc/adc_cali_scheme.h"
 
 #define TIMES 256
-#define SAMPLE_FREQ 8000 // 4 kHz sampling rate
+#define SAMPLE_FREQ 32000 // 4 kHz sampling rate
 #define READ_LEN 512      // Bytes to read per block
 #define EXAMPLE_ADC_UNIT ADC_UNIT_1
 #define EXAMPLE_ADC_CHAN ADC_CHANNEL_6 // ESP32-S3: GPIO7
@@ -29,7 +29,7 @@
 // decimation factor, the firmware measures the real raw rate at startup
 // (see measure_actual_raw_sample_rate) and derives the decimation factor
 // needed to land close to TARGET_OUTPUT_RATE_HZ from that measurement.
-#define TARGET_OUTPUT_RATE_HZ 4000
+#define TARGET_OUTPUT_RATE_HZ 32000
 #define PACKET_SAMPLES 128
 #define STREAM_UART_PORT UART_NUM_0
 
@@ -244,8 +244,8 @@ static void adc_continuous_processing_task(void *pvParameters)
                             // Calculate Peak-to-Peak Amplitude
                             int v_ptp_mv = v_max_mv - v_min_mv;
 
-                            ESP_LOGI(TAG, "Sine Wave | DC Bias: %d mV | V_Max: %d mV | V_Min: %d mV | Peak-to-Peak: %d mV", 
-                                     v_avg_mv, v_max_mv, v_min_mv, v_ptp_mv);
+                            // ESP_LOGI(TAG, "Sine Wave | DC Bias: %d mV | V_Max: %d mV | V_Min: %d mV | Peak-to-Peak: %d mV", 
+                            //          v_avg_mv, v_max_mv, v_min_mv, v_ptp_mv);
                         }
                     }
                     // Reset accumulators for the next batch

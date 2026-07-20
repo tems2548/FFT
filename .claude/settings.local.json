@@ -12,7 +12,8 @@
       "Bash(python -c \"import serial.tools.list_ports as lp; print\\([ \\(p.device, p.description\\) for p in lp.comports\\(\\)]\\)\")",
       "Bash(python -c \"import tkinter; print\\('tkinter OK', tkinter.TkVersion\\)\")",
       "Bash(python -c ' *)",
-      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 40)"
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 40)",
+      "Bash(pip install *)"
     ]
   }
 }

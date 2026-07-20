@@ -3,19 +3,19 @@ Real-time FFT test bench: scrolling time-domain waveform next to its
 live frequency-domain spectrum, driven by a synthetic dynamic test signal.
 
 Run:
-    python fft_visualizer.py
-    python fft_visualizer.py --wave chirp --freq 20 --freq2 80
-    python fft_visualizer.py --wave sine --freq 440 --samplerate 44100
+    python FFT.py
+    python FFT.py --wave chirp --freq 20 --freq2 80
+    python FFT.py --wave sine --freq 440 --samplerate 44100
 
-Use the radio buttons to switch waveform live, and the sliders to change
-the base frequency / sweep target / noise level while it's running.
+Use the waveform dropdown to switch signal live, and the sliders to change
+the base frequency / noise level while it's running.
 
 Or analyze a live ESP32 ADC feed instead of a synthetic signal (see
 main.c, which streams decimated ADC samples over the same USB-UART used
 for flashing/logging):
     python FFT.py --serial              # pick the port from a GUI list
     python FFT.py --serial COM5
-    python fft_visualizer.py --serial /dev/ttyUSB0 --baud 115200
+    python FFT.py --serial /dev/ttyUSB0 --baud 115200
 """
 import argparse
 import csv
@@ -27,10 +27,9 @@ import sys
 import threading
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button, RadioButtons, Slider
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 try:
     import serial
@@ -106,7 +105,7 @@ class SerialReader:
                     return
                 samples_mv = struct.unpack_from(f"<{count}h", buf, 6)
                 for mv in samples_mv:
-                    self.sample_queue.put(mv / 1000.0)
+                    self.sample_queue.put(mv / 1000.0)  # convert mV to V
                 del buf[:needed]
 
 
@@ -114,98 +113,109 @@ CONNECT_TIMEOUT_S = 6.0  # ESP32 reboots on port-open + runs a 1s rate
                           # measurement before its first META packet.
 
 
-def pick_serial_port_gui(default_baud):
-    """Tkinter dialog to pick a serial port and connect to the ESP32.
+class SerialPortDialog(QtWidgets.QDialog):
+    """Qt dialog to pick a serial port and connect to the ESP32.
 
-    Blocks until the user connects successfully (returning the live
-    SerialReader) or closes the window (exiting the process) — Tkinter is
-    stdlib so this adds no new dependency.
+    exec() returns Accepted once a live SerialReader (with sample_rate
+    already populated) is available as self.reader / self.port, or
+    Rejected if the user closes the window.
     """
-    import tkinter as tk
-    from tkinter import ttk
 
-    import serial.tools.list_ports as list_ports
+    def __init__(self, default_baud, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connect to ESP32")
+        self.setMinimumWidth(420)
+        self.reader = None
+        self.port = None
+        self._pending_reader = None
+        self._pending_port = None
+        self._deadline = 0.0
 
-    result = {}
-    root = tk.Tk()
-    root.title("Connect to ESP32")
-    root.resizable(False, False)
+        self._poll_timer = QtCore.QTimer(self)
+        self._poll_timer.setInterval(100)
+        self._poll_timer.timeout.connect(self._poll)
 
-    tk.Label(root, text="Serial port:").grid(row=0, column=0, sticky="w", padx=8, pady=(10, 2))
-    port_var = tk.StringVar()
-    port_combo = ttk.Combobox(root, textvariable=port_var, width=42, state="readonly")
-    port_combo.grid(row=0, column=1, columnspan=2, padx=8, pady=(10, 2))
+        layout = QtWidgets.QGridLayout(self)
 
-    def refresh_ports():
-        ports = [f"{p.device} — {p.description}" for p in list_ports.comports()]
-        port_combo["values"] = ports
-        if ports and port_var.get() not in ports:
-            port_combo.current(0)
+        layout.addWidget(QtWidgets.QLabel("Serial port:"), 0, 0)
+        self.port_combo = QtWidgets.QComboBox()
+        layout.addWidget(self.port_combo, 0, 1, 1, 2)
+        refresh_btn = QtWidgets.QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_ports)
+        layout.addWidget(refresh_btn, 0, 3)
 
-    tk.Button(root, text="Refresh", command=refresh_ports).grid(row=0, column=3, padx=8)
-    refresh_ports()
+        layout.addWidget(QtWidgets.QLabel("Baud rate:"), 1, 0)
+        self.baud_edit = QtWidgets.QLineEdit(str(default_baud))
+        layout.addWidget(self.baud_edit, 1, 1)
 
-    tk.Label(root, text="Baud rate:").grid(row=1, column=0, sticky="w", padx=8, pady=2)
-    baud_var = tk.StringVar(value=str(default_baud))
-    tk.Entry(root, textvariable=baud_var, width=14).grid(row=1, column=1, sticky="w", padx=8, pady=2)
+        self.status_label = QtWidgets.QLabel("Select a port and click Connect.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setObjectName("dialogStatus")
+        layout.addWidget(self.status_label, 2, 0, 1, 4)
 
-    status_var = tk.StringVar(value="Select a port and click Connect.")
-    tk.Label(root, textvariable=status_var, fg="#555", wraplength=380, justify="left").grid(
-        row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(6, 8)
-    )
+        self.connect_btn = QtWidgets.QPushButton("Connect")
+        self.connect_btn.setDefault(True)
+        self.connect_btn.clicked.connect(self._on_connect)
+        layout.addWidget(self.connect_btn, 3, 0, 1, 4)
 
-    def on_connect():
-        selection = port_var.get()
-        if not selection:
-            status_var.set("No port selected.")
+        self._refresh_ports()
+
+    def _refresh_ports(self):
+        import serial.tools.list_ports as list_ports
+
+        current = self.port_combo.currentData()
+        self.port_combo.clear()
+        ports = list(list_ports.comports())
+        for p in ports:
+            self.port_combo.addItem(f"{p.device} — {p.description}", p.device)
+        if current is not None:
+            i = self.port_combo.findData(current)
+            if i >= 0:
+                self.port_combo.setCurrentIndex(i)
+
+    def _on_connect(self):
+        if self.port_combo.count() == 0:
+            self.status_label.setText("No serial ports found. Plug in the board and Refresh.")
             return
-        port = selection.split(" — ")[0]
+        port = self.port_combo.currentData()
         try:
-            baud = int(baud_var.get())
+            baud = int(self.baud_edit.text())
         except ValueError:
-            status_var.set("Baud rate must be an integer.")
+            self.status_label.setText("Baud rate must be an integer.")
             return
 
-        connect_btn.config(state="disabled")
-        status_var.set(f"Connecting to {port} @ {baud}...")
+        self.connect_btn.setEnabled(False)
+        self.status_label.setText(f"Connecting to {port} @ {baud}...")
 
         try:
             reader = SerialReader(port, baud)
             reader.start()
         except Exception as exc:
-            status_var.set(f"Failed to open {port}: {exc}")
-            connect_btn.config(state="normal")
+            self.status_label.setText(f"Failed to open {port}: {exc}")
+            self.connect_btn.setEnabled(True)
             return
 
-        deadline = time.time() + CONNECT_TIMEOUT_S
+        self._pending_reader = reader
+        self._pending_port = port
+        self._deadline = time.time() + CONNECT_TIMEOUT_S
+        self._poll_timer.start()
 
-        def poll():
-            if reader.sample_rate is not None:
-                result["reader"] = reader
-                result["port"] = port
-                root.destroy()
-                return
-            if time.time() > deadline:
-                reader.stop()
-                status_var.set(
-                    f"No data from {port} within {CONNECT_TIMEOUT_S:.0f}s — "
-                    "check the port/baud, or the board may still be booting. Try again."
-                )
-                connect_btn.config(state="normal")
-                return
-            root.after(100, poll)
-
-        poll()
-
-    connect_btn = tk.Button(root, text="Connect", command=on_connect, width=14)
-    connect_btn.grid(row=3, column=0, columnspan=4, pady=(0, 10))
-
-    root.protocol("WM_DELETE_WINDOW", lambda: (root.destroy(), sys.exit(0)))
-    root.mainloop()
-
-    if "reader" not in result:
-        sys.exit(0)
-    return result["reader"], result["port"]
+    def _poll(self):
+        reader = self._pending_reader
+        if reader.sample_rate is not None:
+            self._poll_timer.stop()
+            self.reader = reader
+            self.port = self._pending_port
+            self.accept()
+            return
+        if time.time() > self._deadline:
+            self._poll_timer.stop()
+            reader.stop()
+            self.status_label.setText(
+                f"No data from {self._pending_port} within {CONNECT_TIMEOUT_S:.0f}s — "
+                "check the port/baud, or the board may still be booting. Try again."
+            )
+            self.connect_btn.setEnabled(True)
 
 
 def sweep_phase(t, f_lo, f_hi, period):
@@ -388,8 +398,401 @@ def save_snapshot_csv(
     return fname
 
 
+# --- Look & feel -----------------------------------------------------------
+# One cohesive dark theme for both the Qt chrome and the plots, instead of
+# matplotlib's default light-gray-on-white. Bigger fonts and higher-contrast
+# accent colors so the four panels stay readable side by side.
+BG = "#11141a"
+PANEL_BG = "#171b23"
+GRID_FG = "#8b93a7"
+TEXT_FG = "#e5e7eb"
+ACCENT_TIME = "#3b82f6"
+ACCENT_FREQ = "#f97316"
+ACCENT_NOISE_FLOOR = "#94a3b8"
+ACCENT_SNR = "#22c55e"
+ACCENT_OK = "#22c55e"
+
+STYLESHEET = f"""
+QWidget {{
+    background: {BG};
+    color: {TEXT_FG};
+    font-size: 13px;
+}}
+QMainWindow, QDialog {{ background: {BG}; }}
+QLabel#sectionTitle {{ font-size: 14px; font-weight: 600; color: {TEXT_FG}; }}
+QLabel#statsLabel {{
+    font-family: Consolas, monospace;
+    font-size: 13px;
+    background: {PANEL_BG};
+    border: 1px solid #262b36;
+    border-radius: 6px;
+    padding: 10px;
+}}
+QLabel#modeLabel {{ color: #9ca3af; font-size: 12px; }}
+QLabel#dialogStatus {{ color: #9ca3af; }}
+QComboBox, QLineEdit {{
+    background: {PANEL_BG};
+    border: 1px solid #2f3542;
+    border-radius: 4px;
+    padding: 4px 6px;
+}}
+QPushButton {{
+    background: #1f2430;
+    border: 1px solid #2f3542;
+    border-radius: 5px;
+    padding: 7px 10px;
+}}
+QPushButton:hover {{ background: #262c3a; }}
+QPushButton:disabled {{ color: #5b6472; }}
+QPushButton#saveButton {{ background: #16321f; border-color: #1f5c34; }}
+QPushButton#saveButton:hover {{ background: #1b3f27; }}
+QSlider::groove:horizontal {{ height: 4px; background: #2a2f3b; border-radius: 2px; }}
+QSlider::handle:horizontal {{
+    background: {ACCENT_TIME};
+    width: 14px; height: 14px; margin: -6px 0; border-radius: 7px;
+}}
+"""
+
+
+def apply_plot_theme(plot_item, title, xlabel, ylabel):
+    plot_item.setTitle(title, color=TEXT_FG, size="12pt")
+    plot_item.setLabel("bottom", xlabel, color=GRID_FG)
+    plot_item.setLabel("left", ylabel, color=GRID_FG)
+    plot_item.showGrid(x=True, y=True, alpha=0.25)
+    plot_item.getAxis("bottom").setTextPen(GRID_FG)
+    plot_item.getAxis("left").setTextPen(GRID_FG)
+
+
+class FFTBenchWindow(QtWidgets.QMainWindow):
+    def __init__(self, args, live, reader, port_label, fs):
+        super().__init__()
+        self.args = args
+        self.live = live
+        self.reader = reader
+        self.fs = fs
+
+        self.window_size = args.window
+        self.samples_per_frame = max(1, int(fs / args.fps))
+        self.buffer = np.zeros(self.window_size)
+        self.hann = np.hanning(self.window_size)
+        self.mag_scale = 2.0 / np.sum(self.hann)
+        self.t_axis = np.linspace(0, self.window_size / fs, self.window_size, endpoint=False)
+        self.freqs = np.fft.rfftfreq(self.window_size, d=1 / fs)
+
+        self.spec_history = np.full((SPECTROGRAM_HISTORY, len(self.freqs)), -100.0)
+        self.noise_history_len = SPECTROGRAM_HISTORY
+        self.noise_time_axis = np.linspace(-self.noise_history_len / args.fps, 0, self.noise_history_len)
+        self.noise_floor_history = np.full(self.noise_history_len, -100.0)
+        self.snr_history = np.full(self.noise_history_len, 0.0)
+
+        self.n = 0
+        self.wave = args.wave
+        self.freq = args.freq
+        self.freq2 = args.freq2
+        self.noise = args.noise
+        self.fps = float(args.fps)
+        self.last_frame_time = None
+        self.last_snapshot = None
+
+        title = f"FFT Test Bench — Live ESP32 ADC ({port_label} @ {fs:.0f} Hz)" if live else "FFT Test Bench"
+        self.setWindowTitle(title)
+        self._build_ui(title)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(int(1000 / args.fps))
+
+    # -- UI construction -----------------------------------------------
+
+    def _build_ui(self, title):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QHBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        root.addWidget(self._build_sidebar(title), 0)
+        root.addWidget(self._build_plots(), 1)
+
+        self.resize(1280, 900)
+
+    def _build_sidebar(self, title):
+        panel = QtWidgets.QWidget()
+        panel.setFixedWidth(260)
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setSpacing(14)
+
+        mode_label = QtWidgets.QLabel(title)
+        mode_label.setObjectName("modeLabel")
+        mode_label.setWordWrap(True)
+        layout.addWidget(mode_label)
+
+        wave_title = QtWidgets.QLabel("Waveform")
+        wave_title.setObjectName("sectionTitle")
+        layout.addWidget(wave_title)
+        self.wave_combo = QtWidgets.QComboBox()
+        self.wave_combo.addItems(WAVE_TYPES)
+        self.wave_combo.setCurrentText(self.wave)
+        self.wave_combo.currentTextChanged.connect(self._on_wave_change)
+        layout.addWidget(self.wave_combo)
+
+        self.freq_label = QtWidgets.QLabel(f"Frequency: {self.freq:.0f} Hz")
+        layout.addWidget(self.freq_label)
+        self.freq_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        freq_max = max(2, int(min(self.fs / 2, 500)))
+        self.freq_slider.setRange(1, freq_max)
+        self.freq_slider.setValue(int(min(max(self.freq, 1), freq_max)))
+        self.freq_slider.valueChanged.connect(self._on_freq_change)
+        layout.addWidget(self.freq_slider)
+
+        self.noise_label = QtWidgets.QLabel(f"Noise: {self.noise:.2f}")
+        layout.addWidget(self.noise_label)
+        self.noise_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.noise_slider.setRange(0, 50)
+        self.noise_slider.setValue(int(self.noise * 100))
+        self.noise_slider.valueChanged.connect(self._on_noise_change)
+        layout.addWidget(self.noise_slider)
+
+        if self.live:
+            # These controls only affect the synthetic generator; disable
+            # rather than leave them present-but-inert on live ADC data.
+            for w in (self.wave_combo, self.freq_slider, self.noise_slider):
+                w.setEnabled(False)
+
+        layout.addSpacing(6)
+        save_title = QtWidgets.QLabel("Snapshot")
+        save_title.setObjectName("sectionTitle")
+        layout.addWidget(save_title)
+        self.save_button = QtWidgets.QPushButton("Save CSV")
+        self.save_button.setObjectName("saveButton")
+        self.save_button.clicked.connect(self._on_save_click)
+        layout.addWidget(self.save_button)
+        self.save_status_label = QtWidgets.QLabel("")
+        self.save_status_label.setStyleSheet(f"color: {ACCENT_OK};")
+        layout.addWidget(self.save_status_label)
+
+        layout.addSpacing(6)
+        stats_title = QtWidgets.QLabel("Readings")
+        stats_title.setObjectName("sectionTitle")
+        layout.addWidget(stats_title)
+        self.stats_label = QtWidgets.QLabel("—")
+        self.stats_label.setObjectName("statsLabel")
+        self.stats_label.setWordWrap(True)
+        layout.addWidget(self.stats_label)
+
+        layout.addStretch(1)
+        return panel
+
+    def _build_plots(self):
+        pg.setConfigOptions(antialias=True)
+        container = QtWidgets.QWidget()
+        vbox = QtWidgets.QVBoxLayout(container)
+        vbox.setSpacing(10)
+
+        # Time domain
+        self.time_plot = pg.PlotWidget(background=PANEL_BG)
+        apply_plot_theme(
+            self.time_plot.getPlotItem(),
+            "Time domain",
+            "Time in window (s)",
+            "AC amplitude (V, bias removed)" if self.live else "Amplitude",
+        )
+        self.time_curve = self.time_plot.plot(self.t_axis, self.buffer, pen=pg.mkPen(ACCENT_TIME, width=1.5))
+        self.time_plot.setXRange(0, self.window_size / self.fs, padding=0)
+        self.time_plot.setYRange(*((-1.8, 1.8) if self.live else (-2.2, 2.2)))
+        vbox.addWidget(self.time_plot, 1)
+
+        # Frequency domain, with a hover crosshair for reading values off
+        # the curve (a plain static line is hard to read precisely).
+        self.freq_plot = pg.PlotWidget(background=PANEL_BG)
+        apply_plot_theme(self.freq_plot.getPlotItem(), "Frequency domain", "Frequency (Hz)", "Magnitude (dB)")
+        self.freq_curve = self.freq_plot.plot(self.freqs, np.full_like(self.freqs, -100.0), pen=pg.mkPen(ACCENT_FREQ, width=1.5))
+        self.freq_plot.setXRange(0, self.fs / 2, padding=0)
+        self.freq_plot.setYRange(-100, 20, padding=0)
+        self.peak_marker = pg.ScatterPlotItem(size=9, brush=pg.mkBrush(ACCENT_FREQ), pen=pg.mkPen(TEXT_FG, width=1))
+        self.freq_plot.addItem(self.peak_marker)
+        self._add_crosshair(self.freq_plot, "Hz", "dB")
+        vbox.addWidget(self.freq_plot, 1)
+
+        # Spectrogram
+        self.spec_plot = pg.PlotWidget(background=PANEL_BG)
+        apply_plot_theme(self.spec_plot.getPlotItem(), "Spectrogram", "Time (s ago)", "Frequency (Hz)")
+        self.spec_image = pg.ImageItem()
+        # setRect() computes its transform from the image's current
+        # width/height, so an image must be assigned before calling it —
+        # otherwise it silently scales against a 1x1 placeholder and the
+        # image ends up rendered far outside the plot's view range.
+        self.spec_image.setImage(self.spec_history, autoLevels=False, levels=(-100, 20))
+        self.spec_image.setColorMap(pg.colormap.get("magma"))
+        x0 = -SPECTROGRAM_HISTORY / self.args.fps
+        self.spec_image.setRect(QtCore.QRectF(x0, 0, -x0, self.fs / 2))
+        self.spec_plot.addItem(self.spec_image)
+        self.spec_plot.setXRange(x0, 0, padding=0)
+        self.spec_plot.setYRange(0, self.fs / 2, padding=0)
+        cbar = pg.ColorBarItem(values=(-100, 20), colorMap=pg.colormap.get("magma"), label="dB")
+        cbar.setImageItem(self.spec_image, insert_in=self.spec_plot.getPlotItem())
+        vbox.addWidget(self.spec_plot, 1)
+
+        # Noise floor / SNR trend
+        self.noise_plot = pg.PlotWidget(background=PANEL_BG)
+        apply_plot_theme(self.noise_plot.getPlotItem(), "Noise floor & SNR trend", "Time (s ago)", "dB")
+        self.noise_floor_curve = self.noise_plot.plot(
+            self.noise_time_axis, self.noise_floor_history, pen=pg.mkPen(ACCENT_NOISE_FLOOR, width=1.5), name="Noise floor (dB)"
+        )
+        self.snr_curve = self.noise_plot.plot(
+            self.noise_time_axis, self.snr_history, pen=pg.mkPen(ACCENT_SNR, width=1.5), name="SNR (dB)"
+        )
+        self.noise_plot.addLegend(offset=(10, 10))
+        self.noise_plot.setXRange(self.noise_time_axis[0], self.noise_time_axis[-1], padding=0)
+        self.noise_plot.setYRange(-100, 60, padding=0)
+        vbox.addWidget(self.noise_plot, 1)
+
+        return container
+
+    def _add_crosshair(self, plot_widget, x_unit, y_unit):
+        vline = pg.InfiniteLine(angle=90, pen=pg.mkPen("#4b5563", width=1))
+        hline = pg.InfiniteLine(angle=0, pen=pg.mkPen("#4b5563", width=1))
+        label = pg.TextItem(color=TEXT_FG, anchor=(0, 1))
+        plot_widget.addItem(vline, ignoreBounds=True)
+        plot_widget.addItem(hline, ignoreBounds=True)
+        plot_widget.addItem(label)
+        vline.hide()
+        hline.hide()
+        label.hide()
+
+        def on_move(pos):
+            plot_item = plot_widget.getPlotItem()
+            if not plot_item.sceneBoundingRect().contains(pos):
+                vline.hide()
+                hline.hide()
+                label.hide()
+                return
+            mouse_pt = plot_item.vb.mapSceneToView(pos)
+            x, y = mouse_pt.x(), mouse_pt.y()
+            vline.setPos(x)
+            hline.setPos(y)
+            label.setPos(x, y)
+            label.setText(f"{x:.1f} {x_unit}, {y:.1f} {y_unit}")
+            vline.show()
+            hline.show()
+            label.show()
+
+        plot_widget.scene().sigMouseMoved.connect(on_move)
+
+    # -- Control callbacks ------------------------------------------------
+
+    def _on_wave_change(self, text):
+        self.wave = text
+
+    def _on_freq_change(self, value):
+        self.freq = float(value)
+        self.freq2 = self.freq * 3
+        self.freq_label.setText(f"Frequency: {value} Hz")
+
+    def _on_noise_change(self, value):
+        self.noise = value / 100.0
+        self.noise_label.setText(f"Noise: {self.noise:.2f}")
+
+    def _on_save_click(self):
+        if self.last_snapshot is None:
+            return
+        fname = save_snapshot_csv(**self.last_snapshot)
+        self.save_status_label.setText(f"Saved {fname}")
+
+    # -- Frame update -------------------------------------------------------
+
+    def update_frame(self):
+        now = time.perf_counter()
+        if self.last_frame_time is not None:
+            dt = now - self.last_frame_time
+            if dt > 0:
+                self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
+        self.last_frame_time = now
+
+        if self.live:
+            new_samples = []
+            try:
+                while True:
+                    new_samples.append(self.reader.sample_queue.get_nowait())
+            except queue.Empty:
+                pass
+            n_new = min(len(new_samples), self.window_size)
+            new = np.array(new_samples[-n_new:]) if n_new else None
+        else:
+            n_new = self.samples_per_frame
+            new = generate_chunk(
+                self.wave, self.n, self.samples_per_frame, self.fs,
+                self.freq, self.freq2, self.args.sweep_period, self.noise,
+            )
+
+        if new is not None and n_new > 0:
+            self.buffer[:-n_new] = self.buffer[n_new:]
+            self.buffer[-n_new:] = new
+            self.n += n_new
+
+        # Live signals ride on a DC bias (e.g. a 1.65 V mid-supply front
+        # end), which would otherwise dominate the display and leak into
+        # nearby FFT bins through the Hann window's sidelobes. Removing the
+        # window's mean AC-couples it in software.
+        display_buffer = self.buffer - self.buffer.mean() if self.live else self.buffer
+        self.time_curve.setData(self.t_axis, display_buffer)
+
+        spectrum = np.fft.rfft(display_buffer * self.hann)
+        mag = np.abs(spectrum) * self.mag_scale
+        db = 20 * np.log10(mag + 1e-12)
+        self.freq_curve.setData(self.freqs, db)
+
+        peak_freq, peak_db, peak_idx = find_peak(db, self.window_size, self.fs)
+        harmonics = find_harmonics(db, peak_idx, self.window_size, self.fs, max_harmonic=5)
+        harmonic2 = harmonics.get(2)
+        harmonic_freq, harmonic_db, harmonic_idx = harmonic2 if harmonic2 else (None, None, None)
+        snr_db, noise_floor_db = compute_snr(mag, peak_idx, harmonic_idx)
+        thd_percent, _thd_db = compute_thd(mag, peak_idx, harmonics)
+        self.peak_marker.setData([peak_freq], [peak_db])
+
+        stats_lines = [
+            f"FPS:      {self.fps:5.1f}",
+            f"Peak:     {peak_freq:8.2f} Hz  ({peak_db:6.1f} dB)",
+            "2nd harm: " + (f"{harmonic_freq:8.2f} Hz  ({harmonic_db:6.1f} dB)" if harmonic_freq is not None else "n/a"),
+            f"SNR:      {snr_db:6.1f} dB",
+            f"THD:      {thd_percent:6.2f} %",
+        ]
+        self.stats_label.setText("\n".join(stats_lines))
+
+        self.spec_history[:-1] = self.spec_history[1:]
+        self.spec_history[-1] = db
+        self.spec_image.setImage(self.spec_history, autoLevels=False)
+
+        self.noise_floor_history[:-1] = self.noise_floor_history[1:]
+        self.noise_floor_history[-1] = noise_floor_db
+        self.snr_history[:-1] = self.snr_history[1:]
+        self.snr_history[-1] = snr_db
+        self.noise_floor_curve.setData(self.noise_time_axis, self.noise_floor_history)
+        self.snr_curve.setData(self.noise_time_axis, self.snr_history)
+
+        self.last_snapshot = dict(
+            t_axis=self.t_axis,
+            buffer=display_buffer.copy(),
+            freqs=self.freqs,
+            mag=mag,
+            db=db,
+            peak_freq=peak_freq,
+            peak_db=peak_db,
+            harmonic_freq=harmonic_freq,
+            harmonic_db=harmonic_db,
+            snr_db=snr_db,
+            noise_floor_db=noise_floor_db,
+            thd_percent=thd_percent,
+        )
+
+    def closeEvent(self, event):
+        if self.live and self.reader is not None:
+            self.reader.stop()
+        super().closeEvent(event)
+
+
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--wave", choices=WAVE_TYPES, default="demo")
     p.add_argument("--freq", type=float, default=10.0, help="base frequency (Hz)")
     p.add_argument("--freq2", type=float, default=60.0, help="chirp target frequency (Hz)")
@@ -411,13 +814,20 @@ def main():
     p.add_argument("--baud", type=int, default=115200, help="serial baud rate for --serial")
     args = p.parse_args()
 
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(STYLESHEET)
+
     live = args.serial is not None
     reader = None
     port_label = args.serial
     fs = args.samplerate
+
     if live:
         if args.serial == "__PICK__":
-            reader, port_label = pick_serial_port_gui(args.baud)
+            dialog = SerialPortDialog(args.baud)
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                sys.exit(0)
+            reader, port_label = dialog.reader, dialog.port
             fs = float(reader.sample_rate)
         else:
             reader = SerialReader(args.serial, args.baud)
@@ -435,240 +845,9 @@ def main():
                 )
             fs = float(reader.sample_rate)
 
-    window_size = args.window
-    samples_per_frame = max(1, int(fs / args.fps))
-
-    buffer = np.zeros(window_size)
-    hann = np.hanning(window_size)
-    mag_scale = 2.0 / np.sum(hann)
-    state = {
-        "n": 0,
-        "wave": args.wave,
-        "freq": args.freq,
-        "freq2": args.freq2,
-        "noise": args.noise,
-        "fps": float(args.fps),
-        "last_frame_time": None,
-        "live": live,
-        "reader": reader,
-    }
-
-    fig = plt.figure(figsize=(10, 11))
-    fig.suptitle(
-        f"FFT Test Bench — Live ESP32 ADC ({port_label} @ {fs:.0f} Hz)"
-        if live
-        else "FFT Test Bench — Time / Frequency / Spectrogram / Noise"
-    )
-    ax_time = fig.add_axes([0.32, 0.80, 0.63, 0.16])
-    ax_freq = fig.add_axes([0.32, 0.59, 0.63, 0.16])
-    ax_spec = fig.add_axes([0.32, 0.38, 0.63, 0.16])
-    ax_noise = fig.add_axes([0.32, 0.17, 0.63, 0.16])
-
-    t_axis = np.linspace(0, window_size / fs, window_size, endpoint=False)
-    (line_time,) = ax_time.plot(t_axis, buffer, color="#3b82f6", lw=1)
-    ax_time.set_xlim(0, window_size / fs)
-    if live:
-        # DC bias (e.g. the 1.65 V mid-supply bias of an AC-coupled front
-        # end) is subtracted per-frame before display/FFT, so this is a
-        # fixed range around 0 V sized for the ADC's ~3.3 V full scale.
-        ax_time.set_ylim(-1.8, 1.8)
-        ax_time.set_ylabel("AC amplitude (V, bias removed)")
-    else:
-        ax_time.set_ylim(-2.2, 2.2)
-        ax_time.set_ylabel("Amplitude")
-    ax_time.set_xlabel("Time in window (s)")
-    ax_time.set_title("Time domain")
-    ax_time.grid(alpha=0.3)
-    fps_text = ax_time.text(
-        0.99, 0.95, "", transform=ax_time.transAxes, ha="right", va="top", fontsize=9, family="monospace"
-    )
-
-    freqs = np.fft.rfftfreq(window_size, d=1 / fs)
-    (line_freq,) = ax_freq.plot(freqs, np.full_like(freqs, -100.0), color="#f97316", lw=1)
-    ax_freq.set_xlim(0, fs / 2)
-    ax_freq.set_ylim(-100, 20)
-    ax_freq.set_xlabel("Frequency (Hz)")
-    ax_freq.set_ylabel("Magnitude (dB)")
-    ax_freq.set_title("Frequency domain")
-    ax_freq.grid(alpha=0.3)
-    peak_text = ax_freq.text(
-        0.99, 0.95, "", transform=ax_freq.transAxes, ha="right", va="top", fontsize=9, family="monospace"
-    )
-
-    spec_history = np.full((len(freqs), SPECTROGRAM_HISTORY), -100.0)
-    im_spec = ax_spec.imshow(
-        spec_history,
-        aspect="auto",
-        origin="lower",
-        extent=[-SPECTROGRAM_HISTORY / args.fps, 0, 0, fs / 2],
-        cmap="magma",
-        vmin=-100,
-        vmax=20,
-        interpolation="nearest",
-    )
-    ax_spec.set_xlabel("Time (s ago)")
-    ax_spec.set_ylabel("Frequency (Hz)")
-    ax_spec.set_title("Spectrogram")
-
-    NOISE_HISTORY = SPECTROGRAM_HISTORY
-    noise_time_axis = np.linspace(-NOISE_HISTORY / args.fps, 0, NOISE_HISTORY)
-    noise_floor_history = np.full(NOISE_HISTORY, -100.0)
-    snr_history = np.full(NOISE_HISTORY, 0.0)
-    (line_noise_floor,) = ax_noise.plot(
-        noise_time_axis, noise_floor_history, color="#64748b", lw=1.2, label="Noise floor (dB)"
-    )
-    (line_snr,) = ax_noise.plot(noise_time_axis, snr_history, color="#22c55e", lw=1.2, label="SNR (dB)")
-    ax_noise.set_xlim(noise_time_axis[0], noise_time_axis[-1])
-    ax_noise.set_ylim(-100, 60)
-    ax_noise.set_xlabel("Time (s ago)")
-    ax_noise.set_ylabel("dB")
-    ax_noise.set_title("Noise floor & SNR trend")
-    ax_noise.grid(alpha=0.3)
-    ax_noise.legend(loc="upper left", fontsize=8)
-
-    ax_radio = fig.add_axes([0.03, 0.68, 0.18, 0.24])
-    ax_radio.set_title("Waveform", fontsize=10)
-    radio = RadioButtons(ax_radio, WAVE_TYPES, active=WAVE_TYPES.index(args.wave))
-
-    ax_freq_slider = fig.add_axes([0.32, 0.04, 0.63, 0.02])
-    freq_slider = Slider(ax_freq_slider, "freq (Hz)", 1, min(fs / 2, 500), valinit=args.freq)
-
-    ax_noise_slider = fig.add_axes([0.03, 0.60, 0.18, 0.02])
-    noise_slider = Slider(ax_noise_slider, "noise", 0.0, 0.5, valinit=args.noise)
-
-    ax_save_button = fig.add_axes([0.03, 0.45, 0.18, 0.05])
-    save_button = Button(ax_save_button, "Save CSV")
-    save_status = fig.text(0.03, 0.42, "", fontsize=8, color="#16a34a")
-
-    def on_wave_select(label):
-        state["wave"] = label
-
-    def on_freq_change(val):
-        state["freq"] = val
-        state["freq2"] = val * 3
-
-    def on_noise_change(val):
-        state["noise"] = val
-
-    def on_save_click(_event):
-        last = state.get("last")
-        if last is None:
-            return
-        fname = save_snapshot_csv(**last)
-        save_status.set_text(f"Saved {fname}")
-        fig.canvas.draw_idle()
-
-    radio.on_clicked(on_wave_select)
-    freq_slider.on_changed(on_freq_change)
-    noise_slider.on_changed(on_noise_change)
-    save_button.on_clicked(on_save_click)
-
-    def update(_frame):
-        nonlocal spec_history
-        now = time.perf_counter()
-        if state["last_frame_time"] is not None:
-            dt = now - state["last_frame_time"]
-            if dt > 0:
-                inst_fps = 1.0 / dt
-                state["fps"] = 0.9 * state["fps"] + 0.1 * inst_fps
-        state["last_frame_time"] = now
-        fps_text.set_text(f"{state['fps']:.1f} FPS")
-
-        if state["live"]:
-            new_samples = []
-            try:
-                while True:
-                    new_samples.append(state["reader"].sample_queue.get_nowait())
-            except queue.Empty:
-                pass
-            n_new = min(len(new_samples), window_size)
-            new = np.array(new_samples[-n_new:]) if n_new else None
-        else:
-            n_new = samples_per_frame
-            new = generate_chunk(
-                state["wave"],
-                state["n"],
-                samples_per_frame,
-                fs,
-                state["freq"],
-                state["freq2"],
-                args.sweep_period,
-                state["noise"],
-            )
-
-        if new is not None and n_new > 0:
-            # In-place shift (no new array allocation, unlike np.roll) then
-            # drop the new chunk into the vacated tail.
-            buffer[:-n_new] = buffer[n_new:]
-            buffer[-n_new:] = new
-            state["n"] += n_new
-
-        # Live signals ride on a DC bias (e.g. a 1.65 V mid-supply front
-        # end), which would otherwise dominate the display and leak into
-        # nearby FFT bins through the Hann window's sidelobes. Removing the
-        # window's mean AC-couples it in software.
-        display_buffer = buffer - buffer.mean() if state["live"] else buffer
-
-        line_time.set_ydata(display_buffer)
-
-        spectrum = np.fft.rfft(display_buffer * hann)
-        mag = np.abs(spectrum) * mag_scale
-        db = 20 * np.log10(mag + 1e-12)
-        line_freq.set_ydata(db)
-
-        peak_freq, peak_db, peak_idx = find_peak(db, window_size, fs)
-        harmonics = find_harmonics(db, peak_idx, window_size, fs, max_harmonic=5)
-        harmonic2 = harmonics.get(2)
-        harmonic_freq, harmonic_db, harmonic_idx = harmonic2 if harmonic2 else (None, None, None)
-        snr_db, noise_floor_db = compute_snr(mag, peak_idx, harmonic_idx)
-        thd_percent, _thd_db = compute_thd(mag, peak_idx, harmonics)
-
-        lines = [f"peak: {peak_freq:.2f} Hz  ({peak_db:.1f} dB)"]
-        if harmonic_freq is not None:
-            lines.append(f"2nd harmonic: {harmonic_freq:.2f} Hz  ({harmonic_db:.1f} dB)")
-        else:
-            lines.append("2nd harmonic: n/a")
-        lines.append(f"SNR: {snr_db:.1f} dB")
-        lines.append(f"THD: {thd_percent:.2f} %")
-        peak_text.set_text("\n".join(lines))
-
-        # Measured faster than an in-place slice-shift for this 2D shape
-        # (numpy's overlap-safe copy path costs more here than a realloc).
-        spec_history = np.roll(spec_history, -1, axis=1)
-        spec_history[:, -1] = db
-        im_spec.set_data(spec_history)
-
-        noise_floor_history[:-1] = noise_floor_history[1:]
-        noise_floor_history[-1] = noise_floor_db
-        snr_history[:-1] = snr_history[1:]
-        snr_history[-1] = snr_db
-        line_noise_floor.set_ydata(noise_floor_history)
-        line_snr.set_ydata(snr_history)
-
-        state["last"] = dict(
-            t_axis=t_axis,
-            buffer=display_buffer.copy(),
-            freqs=freqs,
-            mag=mag,
-            db=db,
-            peak_freq=peak_freq,
-            peak_db=peak_db,
-            harmonic_freq=harmonic_freq,
-            harmonic_db=harmonic_db,
-            snr_db=snr_db,
-            noise_floor_db=noise_floor_db,
-            thd_percent=thd_percent,
-        )
-
-        return line_time, line_freq, peak_text, im_spec, fps_text, line_noise_floor, line_snr
-
-    # All axis limits are fixed up front (the noise panel no longer
-    # autoscales per frame), so blitting is safe here: matplotlib redraws
-    # only the artists update() returns instead of the whole figure.
-    anim = FuncAnimation(fig, update, interval=1000 / args.fps, blit=True, cache_frame_data=False)
-    if live:
-        fig.canvas.mpl_connect("close_event", lambda _evt: reader.stop())
-    plt.show()
+    window = FFTBenchWindow(args, live, reader, port_label, fs)
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
