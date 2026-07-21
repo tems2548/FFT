@@ -43,6 +43,20 @@ MAGIC_META = b"META"
 MAGIC_DATA = b"DATA"
 
 
+def crc16_ccitt(data, crc=0xFFFF):
+    """CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF). Must match main.c's
+    crc16_ccitt_update() bit-for-bit -- verified against the standard test
+    vector (CRC of b"123456789" == 0x29B1) when this was written."""
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
 def _cosine_sum_window(n, coeffs):
     """Generic cosine-sum window: coeffs[0] - coeffs[1]*cos(2*pi*k/(n-1)) +
     coeffs[2]*cos(4*pi*k/(n-1)) - ... Covers Hann/Hamming/Blackman/
@@ -86,6 +100,8 @@ class SerialReader:
         self.ser = serial.Serial(port, baud, timeout=0.5)
         self.sample_queue = queue.Queue()
         self.sample_rate = None
+        self.packets_ok = 0
+        self.packets_bad = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -121,20 +137,32 @@ class SerialReader:
                 del buf[:idx]
 
             if buf.startswith(MAGIC_META):
-                if len(buf) < 8:
+                if len(buf) < 10:
                     return
-                (self.sample_rate,) = struct.unpack_from("<I", buf, 4)
-                del buf[:8]
+                rate_bytes = bytes(buf[4:8])
+                (crc_received,) = struct.unpack_from("<H", buf, 8)
+                if crc16_ccitt(rate_bytes) == crc_received:
+                    (self.sample_rate,) = struct.unpack_from("<I", rate_bytes, 0)
+                    self.packets_ok += 1
+                else:
+                    self.packets_bad += 1
+                del buf[:10]
             else:  # MAGIC_DATA
                 if len(buf) < 6:
                     return
                 (count,) = struct.unpack_from("<H", buf, 4)
-                needed = 6 + count * 2
+                needed = 8 + count * 2  # magic(4) + count(2) + samples + crc(2)
                 if len(buf) < needed:
                     return
-                samples_mv = struct.unpack_from(f"<{count}h", buf, 6)
-                for mv in samples_mv:
-                    self.sample_queue.put(mv / 1000.0)  # convert mV to V
+                payload = bytes(buf[4 : 6 + count * 2])  # count field + samples
+                (crc_received,) = struct.unpack_from("<H", buf, 6 + count * 2)
+                if crc16_ccitt(payload) == crc_received:
+                    samples_mv = struct.unpack_from(f"<{count}h", payload, 2)
+                    for mv in samples_mv:
+                        self.sample_queue.put(mv / 1000.0)  # convert mV to V
+                    self.packets_ok += 1
+                else:
+                    self.packets_bad += 1
                 del buf[:needed]
 
 
@@ -540,6 +568,10 @@ ACCENT_FREQ = "#f97316"
 ACCENT_NOISE_FLOOR = "#94a3b8"
 ACCENT_SNR = "#22c55e"
 ACCENT_OK = "#22c55e"
+ACCENT_PEAK_HOLD = "#fbbf24"
+ACCENT_PHASE = "#a78bfa"
+ACCENT_CURSOR_A = "#38bdf8"
+ACCENT_CURSOR_B = "#fb7185"
 
 STYLESHEET = f"""
 QWidget {{
@@ -624,6 +656,7 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.fps = float(args.fps)
         self.last_frame_time = None
         self.last_snapshot = None
+        self.paused = False
 
         # Power-domain exponential averaging of the spectrum (like a real
         # analyzer's "trace averaging"), so the displayed curve and all the
@@ -634,6 +667,17 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         # averaging logs is statistically biased.
         self.spectrum_alpha = 1.0 - args.averaging / 100.0
         self.power_avg = None
+
+        self.log_freq_axis = False
+
+        # Max-hold overlay: the highest dB seen at each bin since the last
+        # reset, like a real analyzer's peak-hold trace -- catches
+        # intermittent spurs that come and go between frames, which the
+        # live/averaged trace alone can miss.
+        self.show_peak_hold = True
+        self.peak_hold = np.full(len(self.freqs), -100.0)
+
+        self.show_cursors = False
 
         title = f"FFT Test Bench — Live ESP32 ADC ({port_label} @ {fs:.0f} Hz)" if live else "FFT Test Bench"
         self.setWindowTitle(title)
@@ -650,6 +694,35 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         # it into the old running average would produce a misleading
         # transient; just restart averaging from the next frame instead.
         self.power_avg = None
+
+    def _apply_freq_axis_mode(self):
+        """(Re)configure the frequency plot's X axis for linear or log
+        display. Only PlotDataItem curves (self.freq_curve) get pyqtgraph's
+        automatic log10 transform when setLogMode() is called on the
+        PlotItem -- ScatterPlotItem markers and the crosshair's
+        InfiniteLines/TextItem are plain GraphicsItems that don't
+        participate in that, so their positions are converted manually via
+        _freq_to_axis_x() wherever they're set. Applies to both the
+        magnitude and phase plots, which share the same frequency axis."""
+        low = max(self.freqs[1], 1e-6)  # log10(0) is undefined; nothing
+        # below the FFT's own resolution is resolvable anyway.
+        for plot_widget in (self.freq_plot, self.phase_plot):
+            plot_item = plot_widget.getPlotItem()
+            plot_item.setLogMode(x=self.log_freq_axis, y=False)
+            if self.log_freq_axis:
+                plot_item.setXRange(np.log10(low), np.log10(self.fs / 2), padding=0)
+            else:
+                plot_item.setXRange(0, self.fs / 2, padding=0)
+
+    def _freq_to_axis_x(self, freq):
+        return np.log10(freq) if self.log_freq_axis else freq
+
+    def _axis_x_to_freq(self, axis_x):
+        if not self.log_freq_axis:
+            return axis_x
+        # Guard against a pathological cursor/mouse position (e.g. dragged
+        # or left in a stale coordinate space) overflowing float range.
+        return 10 ** min(axis_x, 300)
 
     # -- UI construction -----------------------------------------------
 
@@ -670,7 +743,16 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self._build_sidebar(title))
         root.addWidget(scroll, 0)
-        root.addWidget(self._build_plots(), 1)
+
+        # Each plot has a minimum readable height (set in _build_plots), so
+        # once there are enough panels to not all fit at a comfortable size,
+        # scroll the column instead of silently squeezing every plot thinner.
+        plots_scroll = QtWidgets.QScrollArea()
+        plots_scroll.setWidgetResizable(True)
+        plots_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        plots_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        plots_scroll.setWidget(self._build_plots())
+        root.addWidget(plots_scroll, 1)
 
         self.resize(1320, 900)
 
@@ -715,6 +797,52 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         averaging_hint.setWordWrap(True)
         layout.addWidget(averaging_hint)
 
+        self.log_axis_checkbox = QtWidgets.QCheckBox("Log frequency axis")
+        self.log_axis_checkbox.setChecked(self.log_freq_axis)
+        self.log_axis_checkbox.toggled.connect(self._on_log_axis_toggle)
+        layout.addWidget(self.log_axis_checkbox)
+        log_axis_hint = QtWidgets.QLabel(
+            "Spreads low frequencies out instead of squeezing them into a\n"
+            "sliver of a wide linear range — closer to how you'd read an\n"
+            "octave/decade-spaced signal."
+        )
+        log_axis_hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        log_axis_hint.setWordWrap(True)
+        layout.addWidget(log_axis_hint)
+
+        peak_hold_row = QtWidgets.QHBoxLayout()
+        self.peak_hold_checkbox = QtWidgets.QCheckBox("Peak hold")
+        self.peak_hold_checkbox.setChecked(self.show_peak_hold)
+        self.peak_hold_checkbox.toggled.connect(self._on_peak_hold_toggle)
+        peak_hold_row.addWidget(self.peak_hold_checkbox)
+        self.peak_hold_reset_button = QtWidgets.QPushButton("Reset")
+        self.peak_hold_reset_button.clicked.connect(self._on_peak_hold_reset)
+        peak_hold_row.addWidget(self.peak_hold_reset_button)
+        layout.addLayout(peak_hold_row)
+        peak_hold_hint = QtWidgets.QLabel(
+            "Dashed trace tracks the highest level ever seen per bin —\n"
+            "catches intermittent spurs the live trace alone can miss."
+        )
+        peak_hold_hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        peak_hold_hint.setWordWrap(True)
+        layout.addWidget(peak_hold_hint)
+
+        self.cursors_checkbox = QtWidgets.QCheckBox("Delta cursors")
+        self.cursors_checkbox.setChecked(self.show_cursors)
+        self.cursors_checkbox.toggled.connect(self._on_cursors_toggle)
+        layout.addWidget(self.cursors_checkbox)
+        cursors_hint = QtWidgets.QLabel(
+            "Drag the two lines on the time/frequency plots to measure\n"
+            "the difference between any two points."
+        )
+        cursors_hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        cursors_hint.setWordWrap(True)
+        layout.addWidget(cursors_hint)
+        self.cursor_label = QtWidgets.QLabel("—")
+        self.cursor_label.setObjectName("statsLabel")
+        self.cursor_label.setWordWrap(True)
+        layout.addWidget(self.cursor_label)
+
         wave_title = QtWidgets.QLabel("Waveform")
         wave_title.setObjectName("sectionTitle")
         layout.addWidget(wave_title)
@@ -751,6 +879,9 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         save_title = QtWidgets.QLabel("Snapshot")
         save_title.setObjectName("sectionTitle")
         layout.addWidget(save_title)
+        self.pause_button = QtWidgets.QPushButton("Pause")
+        self.pause_button.clicked.connect(self._on_pause_click)
+        layout.addWidget(self.pause_button)
         self.save_button = QtWidgets.QPushButton("Save CSV")
         self.save_button.setObjectName("saveButton")
         self.save_button.clicked.connect(self._on_save_click)
@@ -762,6 +893,13 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.fps_label = QtWidgets.QLabel("")
         self.fps_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         layout.addWidget(self.fps_label)
+
+        if self.live:
+            self.link_label = QtWidgets.QLabel("")
+            self.link_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+            layout.addWidget(self.link_label)
+        else:
+            self.link_label = None
 
         self.signal_label = self._add_stats_section(layout, "Signal")
         self.harmonics_label = self._add_stats_section(layout, "Harmonics")
@@ -797,6 +935,10 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.time_curve = self.time_plot.plot(self.t_axis, self.buffer, pen=pg.mkPen(ACCENT_TIME, width=1.5))
         self.time_plot.setXRange(0, self.window_size / self.fs, padding=0)
         self.time_plot.setYRange(*((-1.8, 1.8) if self.live else (-2.2, 2.2)))
+        self.time_plot.setMinimumHeight(180)
+        self.time_cursor_a, self.time_cursor_b = self._add_delta_cursor_pair(
+            self.time_plot, 0, self.window_size / self.fs
+        )
         vbox.addWidget(self.time_plot, 1)
 
         # Frequency domain, with a hover crosshair for reading values off
@@ -804,8 +946,12 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.freq_plot = pg.PlotWidget(background=PANEL_BG)
         apply_plot_theme(self.freq_plot.getPlotItem(), "Frequency domain", "Frequency (Hz)", "Magnitude (dB)")
         self.freq_curve = self.freq_plot.plot(self.freqs, np.full_like(self.freqs, -100.0), pen=pg.mkPen(ACCENT_FREQ, width=1.5))
-        self.freq_plot.setXRange(0, self.fs / 2, padding=0)
+        self.peak_hold_curve = self.freq_plot.plot(
+            self.freqs, self.peak_hold, pen=pg.mkPen(ACCENT_PEAK_HOLD, width=1, style=QtCore.Qt.PenStyle.DashLine)
+        )
+        self.peak_hold_curve.setVisible(self.show_peak_hold)
         self.freq_plot.setYRange(-100, 20, padding=0)
+        self.freq_plot.setMinimumHeight(180)
         self.peak_marker = pg.ScatterPlotItem(size=9, brush=pg.mkBrush(ACCENT_FREQ), pen=pg.mkPen(TEXT_FG, width=1))
         self.freq_plot.addItem(self.peak_marker)
         self.second_peak_marker = pg.ScatterPlotItem(
@@ -813,7 +959,25 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         )
         self.freq_plot.addItem(self.second_peak_marker)
         self._add_crosshair(self.freq_plot, "Hz", "dB")
+        self.freq_cursor_a, self.freq_cursor_b = self._add_delta_cursor_pair(self.freq_plot, 0, self.fs / 2)
         vbox.addWidget(self.freq_plot, 1)
+
+        # Phase spectrum, from the raw (unaveraged) FFT bins -- unlike the
+        # magnitude trace above, phase can't be power-averaged frame to
+        # frame without special handling (see the comment on self.power_avg
+        # for why vector-averaging isn't used), so this always shows the
+        # instantaneous phase. Bins that aren't meaningfully above the
+        # noise floor are blanked out (NaN) rather than plotted, since raw
+        # phase there is essentially random and would just be visual noise.
+        self.phase_plot = pg.PlotWidget(background=PANEL_BG)
+        apply_plot_theme(self.phase_plot.getPlotItem(), "Phase spectrum", "Frequency (Hz)", "Phase (deg)")
+        self.phase_curve = self.phase_plot.plot(self.freqs, np.zeros_like(self.freqs), pen=pg.mkPen(ACCENT_PHASE, width=1.5))
+        self.phase_plot.setYRange(-180, 180, padding=0)
+        self.phase_plot.setMinimumHeight(180)
+        self._add_crosshair(self.phase_plot, "Hz", "deg")
+        vbox.addWidget(self.phase_plot, 1)
+
+        self._apply_freq_axis_mode()  # needs both freq_plot and phase_plot to exist
 
         # Spectrogram
         self.spec_plot = pg.PlotWidget(background=PANEL_BG)
@@ -832,6 +996,7 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.spec_plot.setYRange(0, self.fs / 2, padding=0)
         cbar = pg.ColorBarItem(values=(-100, 20), colorMap=pg.colormap.get("magma"), label="dB")
         cbar.setImageItem(self.spec_image, insert_in=self.spec_plot.getPlotItem())
+        self.spec_plot.setMinimumHeight(180)
         vbox.addWidget(self.spec_plot, 1)
 
         # Noise floor / SNR trend
@@ -846,9 +1011,26 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.noise_plot.addLegend(offset=(10, 10))
         self.noise_plot.setXRange(self.noise_time_axis[0], self.noise_time_axis[-1], padding=0)
         self.noise_plot.setYRange(-100, 60, padding=0)
+        self.noise_plot.setMinimumHeight(180)
         vbox.addWidget(self.noise_plot, 1)
 
         return container
+
+    def _add_delta_cursor_pair(self, plot_widget, x_lo, x_hi):
+        """Two draggable vertical lines (pyqtgraph's built-in movable
+        InfiniteLine, so dragging needs no custom mouse-event code) at 25%
+        and 75% across the given range. Hidden until "Delta cursors" is
+        checked. Readout is recomputed on every drag (sigPositionChanged)
+        as well as every animation frame, so it tracks both cursor moves
+        and incoming live data."""
+        span = x_hi - x_lo
+        line_a = pg.InfiniteLine(pos=x_lo + span * 0.25, angle=90, movable=True, pen=pg.mkPen(ACCENT_CURSOR_A, width=1.5))
+        line_b = pg.InfiniteLine(pos=x_lo + span * 0.75, angle=90, movable=True, pen=pg.mkPen(ACCENT_CURSOR_B, width=1.5))
+        for line in (line_a, line_b):
+            plot_widget.addItem(line)
+            line.setVisible(self.show_cursors)
+            line.sigPositionChanged.connect(self._update_cursor_readouts)
+        return line_a, line_b
 
     def _add_crosshair(self, plot_widget, x_unit, y_unit):
         vline = pg.InfiniteLine(angle=90, pen=pg.mkPen("#4b5563", width=1))
@@ -873,7 +1055,10 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
             vline.setPos(x)
             hline.setPos(y)
             label.setPos(x, y)
-            label.setText(f"{x:.1f} {x_unit}, {y:.1f} {y_unit}")
+            # x is in the ViewBox's own coordinate system, which is log10(Hz)
+            # when the log axis is on -- convert back to Hz for the readout.
+            display_x = (10 ** x) if getattr(self, "log_freq_axis", False) else x
+            label.setText(f"{display_x:.1f} {x_unit}, {y:.1f} {y_unit}")
             vline.show()
             hline.show()
             label.show()
@@ -889,6 +1074,83 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
     def _on_averaging_change(self, value):
         self.spectrum_alpha = 1.0 - value / 100.0
         self.averaging_label.setText(f"Averaging: {value}%")
+
+    def _on_log_axis_toggle(self, checked):
+        # A cursor's raw .value() lives in the ViewBox's own coordinate
+        # system, which flips between Hz and log10(Hz) here -- read the
+        # physical frequencies under the OLD mode first, then reposition
+        # the lines in the new mode so they keep pointing at the same spot.
+        #
+        # Signals are blocked while repositioning: setValue() on cursor A
+        # fires sigPositionChanged immediately, which would otherwise run
+        # _update_cursor_readouts() while cursor B still holds its OLD
+        # (now-wrong-interpretation) coordinate -- e.g. reading a leftover
+        # linear value like 1500 as if it were log10(Hz) tries 10**1500.
+        fa = self._axis_x_to_freq(self.freq_cursor_a.value())
+        fb = self._axis_x_to_freq(self.freq_cursor_b.value())
+        self.log_freq_axis = checked
+        self._apply_freq_axis_mode()
+        self.freq_cursor_a.blockSignals(True)
+        self.freq_cursor_b.blockSignals(True)
+        self.freq_cursor_a.setValue(self._freq_to_axis_x(fa))
+        self.freq_cursor_b.setValue(self._freq_to_axis_x(fb))
+        self.freq_cursor_a.blockSignals(False)
+        self.freq_cursor_b.blockSignals(False)
+        self._update_cursor_readouts()
+
+    def _on_peak_hold_toggle(self, checked):
+        self.show_peak_hold = checked
+        self.peak_hold_curve.setVisible(checked)
+
+    def _on_peak_hold_reset(self):
+        self.peak_hold[:] = -100.0
+
+    def _on_cursors_toggle(self, checked):
+        self.show_cursors = checked
+        for line in (self.time_cursor_a, self.time_cursor_b, self.freq_cursor_a, self.freq_cursor_b):
+            line.setVisible(checked)
+        if checked:
+            self._update_cursor_readouts()
+        else:
+            self.cursor_label.setText("—")
+
+    def _update_cursor_readouts(self):
+        if not self.show_cursors:
+            return
+
+        ta = float(self.time_cursor_a.value())
+        tb = float(self.time_cursor_b.value())
+        va = float(np.interp(ta, self.time_curve.xData, self.time_curve.yData))
+        vb = float(np.interp(tb, self.time_curve.xData, self.time_curve.yData))
+        dt = tb - ta
+        dv = vb - va
+        dt_freq = (1.0 / abs(dt)) if dt != 0 else float("inf")
+        unit = "V" if self.live else ""
+
+        # freq_curve.xData is always plain Hz (pyqtgraph's log transform is
+        # applied lazily at render time, not stored back into the curve),
+        # so interpolation needs the converted-back linear frequency here
+        # even though the cursor's own .value() may be in log10(Hz).
+        fa = self._axis_x_to_freq(self.freq_cursor_a.value())
+        fb = self._axis_x_to_freq(self.freq_cursor_b.value())
+        dba = float(np.interp(fa, self.freq_curve.xData, self.freq_curve.yData))
+        dbb = float(np.interp(fb, self.freq_curve.xData, self.freq_curve.yData))
+
+        self.cursor_label.setText(
+            "\n".join([
+                "Time domain",
+                f"A:  {ta * 1000:9.3f} ms  {va:7.3f} {unit}",
+                f"B:  {tb * 1000:9.3f} ms  {vb:7.3f} {unit}",
+                f"dT: {dt * 1000:9.3f} ms  (~{dt_freq:.1f} Hz)",
+                f"dV: {dv:7.3f} {unit}",
+                "",
+                "Frequency domain",
+                f"A:  {fa:9.2f} Hz  {dba:6.1f} dB",
+                f"B:  {fb:9.2f} Hz  {dbb:6.1f} dB",
+                f"df: {fb - fa:9.2f} Hz",
+                f"dDB: {dbb - dba:6.1f} dB",
+            ])
+        )
 
     def _on_wave_change(self, text):
         self.wave = text
@@ -908,9 +1170,31 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         fname = save_snapshot_csv(**self.last_snapshot)
         self.save_status_label.setText(f"Saved {fname}")
 
+    def _on_pause_click(self):
+        self.paused = not self.paused
+        if self.paused:
+            self.pause_button.setText("Resume")
+            self.pause_button.setStyleSheet(f"background: {ACCENT_FREQ}; border-color: {ACCENT_FREQ}; color: #111;")
+            self.fps_label.setText("PAUSED")
+        else:
+            self.pause_button.setText("Pause")
+            self.pause_button.setStyleSheet("")
+            self.last_frame_time = None  # don't count the paused interval as a slow frame
+
     # -- Frame update -------------------------------------------------------
 
     def update_frame(self):
+        if self.paused:
+            if self.live:
+                # Keep draining the queue so it doesn't grow unbounded while
+                # frozen -- the samples are just discarded, not displayed.
+                try:
+                    while True:
+                        self.reader.sample_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            return
+
         now = time.perf_counter()
         if self.last_frame_time is not None:
             dt = now - self.last_frame_time
@@ -956,27 +1240,61 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
             self.power_avg += self.spectrum_alpha * (power_instant - self.power_avg)
         mag = np.sqrt(self.power_avg)
         db = 20 * np.log10(mag + 1e-12)
-        self.freq_curve.setData(self.freqs, db)
+        if self.log_freq_axis:
+            # log10(0) is undefined -- the DC bin can't be plotted on a log
+            # axis, so drop it here (it was never meaningful to look at
+            # anyway once the DC bias is already removed above).
+            self.freq_curve.setData(self.freqs[1:], db[1:])
+        else:
+            self.freq_curve.setData(self.freqs, db)
+
+        np.maximum(self.peak_hold, db, out=self.peak_hold)
+        if self.show_peak_hold:
+            if self.log_freq_axis:
+                self.peak_hold_curve.setData(self.freqs[1:], self.peak_hold[1:])
+            else:
+                self.peak_hold_curve.setData(self.freqs, self.peak_hold)
+
+        self._update_cursor_readouts()
 
         peak_freq, peak_db, peak_idx = find_peak(db, self.window_size, self.fs)
         harmonics = find_harmonics(db, peak_idx, self.window_size, self.fs, max_harmonic=5)
         harmonic2 = harmonics.get(2)
         harmonic_idx = harmonic2[2] if harmonic2 else None
         snr_db, noise_floor_db = compute_snr(mag, peak_idx, harmonic_idx)
+
+        # Raw phase is essentially random noise for bins that aren't
+        # meaningfully above the noise floor; blank those out (NaN, which
+        # pyqtgraph renders as a gap) rather than plotting a scribble.
+        phase_deg = np.degrees(np.angle(spectrum))
+        phase_deg = np.where(db >= noise_floor_db + 10.0, phase_deg, np.nan)
+        if self.log_freq_axis:
+            self.phase_curve.setData(self.freqs[1:], phase_deg[1:])
+        else:
+            self.phase_curve.setData(self.freqs, phase_deg)
+
         thd_percent, _thd_db = compute_thd(mag, peak_idx, harmonics)
         second_peak = find_second_peak(db, peak_idx, self.window_size, self.fs)
         sfdr_db = compute_sfdr(db, peak_idx, self.window_size, self.fs)
         amplitude_pp, rms, crest_factor = compute_time_domain_stats(display_buffer)
         sinad_db = compute_sinad(mag, peak_idx)
         enob = compute_enob(sinad_db)
-        self.peak_marker.setData([peak_freq], [peak_db])
+        self.peak_marker.setData([self._freq_to_axis_x(peak_freq)], [peak_db])
         if second_peak is not None:
-            self.second_peak_marker.setData([second_peak[0]], [second_peak[1]])
+            self.second_peak_marker.setData([self._freq_to_axis_x(second_peak[0])], [second_peak[1]])
         else:
             self.second_peak_marker.setData([], [])
 
         unit = "V" if self.live else ""
         self.fps_label.setText(f"{self.fps:.1f} FPS")
+        if self.link_label is not None:
+            bad = self.reader.packets_bad
+            if bad > 0:
+                self.link_label.setStyleSheet("color: #ef4444; font-size: 11px;")
+                self.link_label.setText(f"Link: {self.reader.packets_ok} ok / {bad} CRC errors")
+            else:
+                self.link_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+                self.link_label.setText(f"Link: {self.reader.packets_ok} packets ok")
 
         if second_peak is not None:
             second_freq, second_db, _idx = second_peak

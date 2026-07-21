@@ -58,13 +58,33 @@ static void init_uart_stream(void)
     }
 }
 
+// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF), covering everything in a
+// packet after the magic word. USB-UART links are usually reliable but not
+// perfectly so, especially at 3 Mbaud; without this, a single corrupted
+// byte would show up as a silent bad voltage reading indistinguishable
+// from a real signal glitch. Matched bit-for-bit by FFT.py's crc16_ccitt().
+static uint16_t crc16_ccitt_update(uint16_t crc, const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+    {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; b++)
+        {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
 // Sends a one-shot header so Python learns the true decimated sample rate
 // instead of having to hardcode it.
 static void send_meta_packet(uint32_t output_sample_rate)
 {
-    uint8_t buf[8];
+    uint8_t buf[10];
     memcpy(buf, "META", 4);
     memcpy(buf + 4, &output_sample_rate, sizeof(output_sample_rate));
+    uint16_t crc = crc16_ccitt_update(0xFFFF, buf + 4, sizeof(output_sample_rate));
+    memcpy(buf + 8, &crc, sizeof(crc));
     uart_write_bytes(STREAM_UART_PORT, (const char *)buf, sizeof(buf));
 }
 
@@ -127,8 +147,15 @@ static void send_data_packet(const int16_t *samples, uint16_t count)
     uint8_t header[6];
     memcpy(header, "DATA", 4);
     memcpy(header + 4, &count, sizeof(count));
+
+    uint16_t crc = crc16_ccitt_update(0xFFFF, header + 4, sizeof(count));
+    crc = crc16_ccitt_update(crc, (const uint8_t *)samples, count * sizeof(int16_t));
+    uint8_t crc_bytes[2];
+    memcpy(crc_bytes, &crc, sizeof(crc));
+
     uart_write_bytes(STREAM_UART_PORT, (const char *)header, sizeof(header));
     uart_write_bytes(STREAM_UART_PORT, (const char *)samples, count * sizeof(int16_t));
+    uart_write_bytes(STREAM_UART_PORT, (const char *)crc_bytes, sizeof(crc_bytes));
 }
 
 // ISR Callback triggered when the DMA buffer fills up
