@@ -162,6 +162,54 @@ class TestModes:
         assert win.duty_cycle_label.text() != "—"
 
 
+class SquareWaveArgs(Args):
+    wave = "square"
+    freq = 20.0 * 2000.0 / 4096  # bin-aligned at this window/samplerate
+    samplerate = 2000.0
+    window = 4096
+    noise = 0.0
+
+
+class TestThdUsesCompleteHarmonicSet:
+    def test_square_wave_thd_reflects_all_harmonics_not_just_2nd_5th(self, make_window):
+        # Regression guard: THD must be computed from the complete
+        # up-to-Nyquist harmonic set update_frame() locates (verified
+        # ~47% for this signal), not the truncated 2nd-5th-only set the
+        # Harmonics panel displays (which reads a misleadingly low ~39%
+        # for the same signal) -- see compute_thd's docstring.
+        win = make_window(SquareWaveArgs())
+        for _ in range(5):
+            win.update_frame()
+        thd_percent = win.last_snapshot["thd_percent"]
+        assert thd_percent is not None
+        assert 42.0 < thd_percent < 52.0  # complete-set range; truncated range is ~35-42%
+
+
+class NoisySquareWaveArgs(Args):
+    wave = "square"
+    freq = 20.0 * 2000.0 / 4096  # bin-aligned at this window/samplerate
+    samplerate = 2000.0
+    window = 4096
+    noise = 0.01
+
+
+class TestSnrExcludesAllHarmonics:
+    def test_square_wave_snr_reflects_full_harmonic_exclusion(self, make_window):
+        # Regression guard: compute_snr's noise-floor average must exclude
+        # every located harmonic, not just the 2nd -- excluding only one
+        # leaves the 3rd/4th/5th/... harmonics' real energy counted as
+        # "noise", understating SNR by ~14dB for this exact signal
+        # (verified: ~38dB with only the 2nd excluded vs. ~52dB with the
+        # full set). fps=10/window=4096 needs the sliding buffer several
+        # frames to fill with real (non-zero-padded) signal before this
+        # settles -- 30 is comfortably past the ~21 needed.
+        win = make_window(NoisySquareWaveArgs())
+        for _ in range(30):
+            win.update_frame()
+        snr_db = win.last_snapshot["snr_db"]
+        assert 45.0 < snr_db < 58.0  # full-exclusion range; single-harmonic range is ~30-42dB
+
+
 class TestSettingsRoundTrip:
     def test_graph_visibility_and_controls_survive_a_restart(self, make_window):
         win1 = make_window()

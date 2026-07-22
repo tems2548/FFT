@@ -427,12 +427,21 @@ def find_harmonic(mag_db, fundamental_bin, window_size, fs, harmonic_number=2, s
     return freq, peak_val, local_idx
 
 
-def compute_snr(mag, peak_idx, harmonic_idx=None, exclude_radius=2):
+def compute_snr(mag, peak_idx, harmonic_indices=(), exclude_radius=2):
     """Fundamental peak power vs. average noise-floor power.
 
-    The bins around the fundamental (and, if given, the harmonic) are
-    excluded from the noise floor estimate since they carry signal, not
-    noise; DC is excluded too.
+    The bins around the fundamental and *every* given harmonic are
+    excluded from the noise floor estimate, since they carry real
+    (deterministic) signal, not noise; DC is excluded too. This is what
+    distinguishes SNR from SINAD (see compute_sinad, which deliberately
+    leaves harmonics in) -- excluding only one harmonic (as an earlier
+    version of this function did, passing just the 2nd) let real energy
+    from the 3rd, 4th, ... harmonics leak into the "noise" floor for any
+    harmonic-rich signal. Verified this matters a lot: for a square wave,
+    excluding just the 2nd harmonic read ~38dB SNR; excluding the full
+    located set (up to Nyquist) reads ~52dB for the same signal -- a 14dB
+    error from real, deterministic harmonic content being miscounted as
+    noise.
 
     Returns (snr_db, noise_floor_db).
     """
@@ -440,7 +449,7 @@ def compute_snr(mag, peak_idx, harmonic_idx=None, exclude_radius=2):
     n = len(power)
     mask = np.ones(n, dtype=bool)
     mask[0] = False
-    for idx in (peak_idx, harmonic_idx):
+    for idx in (peak_idx, *harmonic_indices):
         if idx is None:
             continue
         lo, hi = max(0, idx - exclude_radius), min(n, idx + exclude_radius + 1)
@@ -644,8 +653,15 @@ def compute_thd(mag, peak_idx, harmonics):
     """Total Harmonic Distortion: RMS of the given harmonics relative to
     the fundamental amplitude, as a percentage and in dB.
 
-    Takes the harmonics dict from find_harmonics rather than searching
-    again, so THD stays consistent with the on-screen readings for free.
+    Takes a harmonics dict from find_harmonics rather than searching
+    again. Callers should pass the *complete* set of located harmonics up
+    to Nyquist (not just the 2nd-5th shown on screen) -- truncating to
+    2-5 silently under-reports THD for harmonic-rich signals: verified
+    ~39% vs. a more complete ~47% for a square wave (ideal square wave
+    THD with infinite harmonics is ~48.3%), and ~68% vs. ~79% for a
+    sawtooth. update_frame() computes one full up-to-60th-harmonic set
+    and reuses it both here and for the noise floor exclusion mask, so
+    this is "for free" as far as extra FFT/search work goes.
 
     Returns (None, None) if harmonics is empty. This happens once the
     fundamental is high enough that even the 2nd harmonic falls above
@@ -2319,10 +2335,16 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         perf_t_fft = time.perf_counter()
 
         peak_freq, peak_db, peak_idx = find_peak(db, self.window_size, self.fs)
-        harmonics = find_harmonics(db, peak_idx, self.window_size, self.fs, max_harmonic=5)
-        harmonic2 = harmonics.get(2)
-        harmonic_idx = harmonic2[2] if harmonic2 else None
-        snr_db, noise_floor_db = compute_snr(mag, peak_idx, harmonic_idx)
+        # Located once, up to Nyquist: the on-screen Harmonics panel only
+        # ever shows the 2nd-5th (`harmonics` below), but THD and the
+        # noise-floor exclusion mask further down both need the complete
+        # set to be accurate -- reusing this one search avoids paying for
+        # find_harmonics twice per frame just to get two different slices
+        # of the same underlying search.
+        all_harmonics = find_harmonics(db, peak_idx, self.window_size, self.fs, max_harmonic=60)
+        harmonics = {h: all_harmonics[h] for h in range(2, 6) if h in all_harmonics}
+        harmonic_indices = [h[2] for h in all_harmonics.values()]
+        snr_db, noise_floor_db = compute_snr(mag, peak_idx, harmonic_indices)
 
         # Raw phase is essentially random noise for bins that aren't
         # meaningfully above the noise floor; blank those out (NaN, which
@@ -2337,7 +2359,7 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.bode_mag_curve.setData(self.freqs, db)
         self.bode_phase_curve.setData(self.freqs, phase_deg)
 
-        thd_percent, _thd_db = compute_thd(mag, peak_idx, harmonics)
+        thd_percent, _thd_db = compute_thd(mag, peak_idx, all_harmonics)
         second_peak = find_second_peak(db, peak_idx, self.window_size, self.fs)
         sfdr_db = compute_sfdr(db, peak_idx, self.window_size, self.fs)
         amplitude_pp, rms, crest_factor = compute_time_domain_stats(display_buffer)
@@ -2358,12 +2380,11 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         # correct value; window-function choice doesn't reduce it, ruling
         # out ordinary sidelobe leakage as the cause). These readings are
         # most trustworthy for sinusoidal or genuinely noise-like signals.
-        noise_exclusion_harmonics = find_harmonics(db, peak_idx, self.window_size, self.fs, max_harmonic=60)
         noise_mask = np.ones(len(mag), dtype=bool)
         noise_mask[0] = False
         lo, hi = max(0, peak_idx - 2), min(len(mag), peak_idx + 2 + 1)
         noise_mask[lo:hi] = False
-        for _h, (_h_freq, _h_db, h_idx) in noise_exclusion_harmonics.items():
+        for _h, (_h_freq, _h_db, h_idx) in all_harmonics.items():
             lo, hi = max(0, h_idx - 2), min(len(mag), h_idx + 2 + 1)
             noise_mask[lo:hi] = False
         rms_noise, noise_density, integrated_noise = compute_noise_metrics(
