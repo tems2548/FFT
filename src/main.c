@@ -1,12 +1,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_adc/adc_continuous.h"
 #include "driver/uart.h"
+#include "driver/temperature_sensor.h"
 
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -47,6 +49,12 @@ static TaskHandle_t s_processing_task_handle = NULL;
 static adc_cali_handle_t s_cali_handle = NULL;
 static bool s_calibrated = false;
 
+// ESP32-S3's built-in die temperature sensor -- chip temperature, not
+// ambient/external. Included mainly as a rough drift-correlation proxy,
+// since ADC offset/gain error commonly drifts with die temperature.
+static temperature_sensor_handle_t s_temp_handle = NULL;
+static bool s_temp_sensor_ok = false;
+
 // ESP-IDF's default console output writes to UART0 via a polling ROM path
 // that never installs an interrupt-driven driver, but uart_write_bytes()
 // requires one. Install it once (skip if something else, e.g. esp_console,
@@ -56,6 +64,34 @@ static void init_uart_stream(void)
     if (!uart_is_driver_installed(STREAM_UART_PORT)) {
         ESP_ERROR_CHECK(uart_driver_install(STREAM_UART_PORT, 2048, 0, 0, NULL, 0));
     }
+}
+
+static void init_temperature_sensor(void)
+{
+    // 10-50 degC comfortably covers indoor/enclosure temperatures for this
+    // chip; widen if the board runs somewhere hotter/colder.
+    temperature_sensor_config_t tsens_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
+    esp_err_t ret = temperature_sensor_install(&tsens_config, &s_temp_handle);
+    if (ret == ESP_OK) {
+        ret = temperature_sensor_enable(s_temp_handle);
+    }
+    if (ret == ESP_OK) {
+        s_temp_sensor_ok = true;
+        ESP_LOGI(TAG, "Die temperature sensor enabled.");
+    } else {
+        ESP_LOGW(TAG, "Die temperature sensor unavailable (%s); will report NaN.", esp_err_to_name(ret));
+    }
+}
+
+// NaN if the sensor isn't available -- Python treats that as "no reading"
+// rather than a fabricated 0.0 degC.
+static float read_die_temperature_c(void)
+{
+    float temp_c = NAN;
+    if (s_temp_sensor_ok) {
+        temperature_sensor_get_celsius(s_temp_handle, &temp_c);
+    }
+    return temp_c;
 }
 
 // CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF), covering everything in a
@@ -77,14 +113,17 @@ static uint16_t crc16_ccitt_update(uint16_t crc, const uint8_t *data, size_t len
 }
 
 // Sends a one-shot header so Python learns the true decimated sample rate
+// (and, alongside it, the current die temperature for drift tracking)
 // instead of having to hardcode it.
 static void send_meta_packet(uint32_t output_sample_rate)
 {
-    uint8_t buf[10];
+    uint8_t buf[14];
+    float temp_c = read_die_temperature_c();
     memcpy(buf, "META", 4);
     memcpy(buf + 4, &output_sample_rate, sizeof(output_sample_rate));
-    uint16_t crc = crc16_ccitt_update(0xFFFF, buf + 4, sizeof(output_sample_rate));
-    memcpy(buf + 8, &crc, sizeof(crc));
+    memcpy(buf + 8, &temp_c, sizeof(temp_c));
+    uint16_t crc = crc16_ccitt_update(0xFFFF, buf + 4, sizeof(output_sample_rate) + sizeof(temp_c));
+    memcpy(buf + 12, &crc, sizeof(crc));
     uart_write_bytes(STREAM_UART_PORT, (const char *)buf, sizeof(buf));
 }
 
@@ -190,6 +229,7 @@ static void adc_continuous_processing_task(void *pvParameters)
     uint32_t decim_count = 0;
     int16_t packet_buf[PACKET_SAMPLES];
     uint16_t packet_idx = 0;
+    uint32_t overflow_count = 0;  // DMA ring-buffer overflows since boot; see ESP_ERR_INVALID_STATE handling below
 
     uint32_t measured_raw_rate = measure_actual_raw_sample_rate(handle);
     uint32_t decimation = measured_raw_rate / TARGET_OUTPUT_RATE_HZ;
@@ -293,6 +333,23 @@ static void adc_continuous_processing_task(void *pvParameters)
             else if (ret == ESP_ERR_TIMEOUT) { break; }
             else if (ret == ESP_ERR_INVALID_STATE)
             {
+                // The DMA ring buffer overflowed -- this task fell behind
+                // draining it (e.g. briefly preempted, or a blocking
+                // uart_write_bytes() call ran long) and hardware samples
+                // were silently dropped by the driver. This is the actual
+                // "sampling jitter" source in this pipeline: real ADC
+                // sampling itself is hardware-clocked and jitter-free, but
+                // *this* event creates a real, unaccounted-for gap in wall-
+                // clock time that the decimated output has no way to
+                // represent -- every sample after it lands at the wrong
+                // point in time relative to what Python's fixed-rate FFT
+                // analysis assumes, unless the in-flight accumulators are
+                // discarded rather than carried across the gap.
+                overflow_count++;
+                ESP_LOGW(TAG, "ADC DMA buffer overflow #%" PRIu32 " -- restarting (dropped in-flight sample)", overflow_count);
+                decim_sum = 0;
+                decim_count = 0;
+                packet_idx = 0;  // discard: may straddle the gap
                 adc_continuous_stop(handle);
                 adc_continuous_start(handle);
                 break;
@@ -327,7 +384,13 @@ static void init_adc_calibration(void)
 void init_adc_continuous(adc_continuous_handle_t *out_handle)
 {
     adc_continuous_handle_cfg_t adc_config = {
-        .max_store_buf_size = 4096, 
+        // At ~80 kHz raw * 4 bytes/sample (~320 KB/s), the old 4096-byte
+        // buffer held only ~13ms of margin before overflowing (see the
+        // ESP_ERR_INVALID_STATE handling below) if the processing task
+        // was delayed even briefly -- e.g. by a blocking uart_write_bytes()
+        // call. 16384 bytes gives ~4x the headroom, trivial on an ESP32-S3
+        // (currently ~4% RAM used overall).
+        .max_store_buf_size = 16384,
         .conv_frame_size = READ_LEN,
     };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, out_handle));
@@ -364,10 +427,14 @@ void app_main(void)
     // 2. Initialize the UART driver used to stream samples to FFT.py
     init_uart_stream();
 
-    // 3. Initialize Hardware
+    // 3. Initialize the die temperature sensor (best-effort; reports NaN
+    //    to Python if unavailable rather than blocking startup)
+    init_temperature_sensor();
+
+    // 4. Initialize Hardware
     init_adc_continuous(&handle);
 
-    // 4. Start Hardware *before* creating the processing task. The task
+    // 5. Start Hardware *before* creating the processing task. The task
     //    runs at higher priority than app_main and begins its startup rate
     //    measurement (see measure_actual_raw_sample_rate) the instant it's
     //    created, so starting the ADC first ensures that window isn't
@@ -375,7 +442,7 @@ void app_main(void)
     ESP_ERROR_CHECK(adc_continuous_start(handle));
     ESP_LOGI(TAG, "ADC Continuous mode initialized and started.");
 
-    // 5. Create Task
+    // 6. Create Task
     TaskHandle_t tmp_handle = NULL;
     xTaskCreate(adc_continuous_processing_task, "adc_process", 4096, handle, 5, &tmp_handle);
     s_processing_task_handle = tmp_handle;

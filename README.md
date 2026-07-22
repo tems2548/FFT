@@ -112,8 +112,14 @@ it again:
 Requires Python 3 with:
 
 ```
-pip install numpy pyqtgraph PyQt6 pyserial
+pip install numpy pyqtgraph PyQt6 pyserial PyOpenGL psutil
 ```
+
+`PyOpenGL` is only needed for the 3D FFT (waterfall) panel, and `psutil` only
+for the CPU/RAM Usage panel and readout — every other panel works without
+them. If either is missing (or, for PyOpenGL, no usable OpenGL context is
+available), that one panel/readout shows an explanatory placeholder instead
+of crashing the app.
 
 Run against live hardware:
 
