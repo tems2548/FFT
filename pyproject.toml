@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gui: constructs a real FFTBenchWindow (Qt offscreen platform, no real display needed, but slower and more environment-sensitive than the pure-function tests)",
+]

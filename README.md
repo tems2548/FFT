@@ -212,6 +212,24 @@ sidebar and turning red the moment any corruption is detected.
 
 **CSV export** — snapshots the full time/frequency arrays plus every computed metric.
 
+## Testing
+
+`src/FFT.py`'s DSP math (CRC, windows, peak/harmonic detection, SNR/SINAD/THD/
+ENOB, noise metrics, Cepstrum, Goertzel, Duty Cycle Analyzer) and wire protocol
+parsing are covered by a `pytest` suite in `tests/`, plus a smaller set of GUI-
+level regression tests that build a real (offscreen) window to check things
+like "every graph starts hidden" and "a hidden panel's per-frame cost stays
+near zero" -- both were real bugs during development that only a running
+window could catch.
+
+```
+pip install pytest
+pytest
+```
+
+The GUI tests redirect all `QSettings` reads/writes to a throwaway temp file,
+never the real settings a normal run persists.
+
 ## Known limitations
 
 - **THD above ~Nyquist/2 fundamentals**: correctly reported as unmeasurable (see
@@ -232,6 +250,7 @@ sidebar and turning red the moment any corruption is detected.
 ```
 src/main.c        ESP-IDF firmware
 src/FFT.py        PyQt6/pyqtgraph visualizer (also the synthetic test bench)
+tests/            pytest suite for FFT.py's DSP math and wire protocol (see Testing)
 platformio.ini    PlatformIO project config (monitor_speed, board, framework)
 sdkconfig.defaults        Persisted Kconfig overrides (console UART baud/mode)
 sdkconfig.esp32-s3-devkitm-1   Generated full sdkconfig (do not hand-edit; see above)
