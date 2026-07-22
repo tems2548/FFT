@@ -188,15 +188,74 @@ noise there).
 
 **Spectrogram** — scrolling waterfall (frequency × time-ago × magnitude color).
 
+**3D FFT (waterfall)** — the same rolling time × frequency × magnitude data as the
+spectrogram, as a rotatable/zoomable OpenGL surface instead of a flat color-mapped
+image. Axes are rescaled to a common ~0–10 visual range purely for a legible 3D
+shape — there are no tick labels, so treat it as a qualitative companion view, not
+a substitute for the calibrated 2D spectrogram. Optional —
+requires `PyOpenGL`; falls back to an explanatory placeholder if it's missing or no
+usable GL context is available.
+
 **Noise floor & SNR trend** — rolling history of both over time.
+
+**Drift Analysis** — rolling history of a selectable metric: frequency, DC bias,
+noise floor, THD, SINAD, or ESP32-S3 die temperature (read from the chip's built-in
+temperature sensor in live mode; reports `n/a` in synthetic mode or if the sensor is
+unavailable).
+
+**Cepstrum Analysis** — `IFFT(log|FFT(x)|)`, for spotting periodic structure in the
+*spectrum itself* (fundamental period / pitch, or an echo delay) that a plain
+magnitude spectrum conflates with the general spectral envelope shape.
+
+**Goertzel Analyzer** — exact magnitude at a handful of user-specified target
+frequencies (default: mains hum at 50/60Hz + 2nd harmonic), computed without a full
+FFT and without being restricted to the FFT's fixed bin grid.
+
+**Performance Benchmark** — wall-clock time per pipeline stage, every frame, on a
+log-scale Y axis (stage costs span more than a decade). This is the app measuring
+its own cost, not the signal — and doubles as live proof that a hidden panel's
+matching stage costs next to nothing (see the performance note below).
+
+**CPU / RAM Usage** — this process's CPU% and RAM (MB) over time. Optional —
+requires `psutil`.
+
+**DSP Laboratory Mode** — shows every stage of the pipeline as its own plot/reading:
+Raw Signal → Remove DC offset → Apply Window Function → Windowed Signal → FFT → Power
+Spectrum → Peak Detection → Harmonic Detection → SINAD → THD → ENOB. Meant for
+learning the pipeline, not routine use.
+
+**Duty Cycle Analyzer Mode** — oscilloscope-style pulse measurements via
+threshold-crossing detection: duty cycle, HIGH/LOW time, rise/fall time, pulse
+width, period, frequency. Most meaningful for square/pulse/PWM signals, not a
+continuous tone.
 
 **Readings panel**, organized into sections:
 - *Signal*: peak freq/dB, 2nd-highest peak, DC bias, peak-to-peak amplitude, RMS,
-  crest factor
+  crest factor, duty cycle, waveform-shape guess
 - *Harmonics*: 2nd through 5th, each with sub-bin-accurate frequency/level
 - *Signal Quality*: SNR, SINAD, ENOB (derived from SINAD), THD (reports `n/a` rather
   than a misleading `0%` once the fundamental is high enough that even the 2nd
   harmonic exceeds Nyquist — a hard physical limit, not a bug), SFDR
+- *Noise Analysis*: RMS noise, amplitude spectral density (V/√Hz, auto-scaled to
+  nV/µV/mV), integrated broadband RMS noise
+
+**Sidebar organization** — collapsible sections (Graphs / Spectrum Controls /
+Waveform / Snapshot & Export / Readings / Advanced Analysis) instead of one long
+flat list; Show All / Hide All buttons for the 12 graph checkboxes, grouped into
+Core / Trends / Advanced clusters with hover tooltips; every graph defaults to
+**hidden** at launch (see the performance note below), and the last-used layout,
+FFT window, averaging, log-axis, drift metric, and Goertzel targets are remembered
+across restarts (`QSettings`).
+
+**Performance: hidden panels cost (close to) nothing** — Cepstrum, Goertzel, the 2D
+spectrogram, the 3D waterfall, and the Performance Benchmark/CPU-RAM panels
+themselves are only computed while their panel is actually visible. Toggling one
+off doesn't just hide it — it stops paying for it, verified directly in the
+Performance Benchmark panel (a hidden panel's own stage reads ~0) and by an
+automated regression test (`tests/test_gui_smoke.py`).
+
+**Keyboard shortcuts** — `Space` pause/resume, `Ctrl+S` save CSV, `Ctrl+E` export,
+`Ctrl+R` reset peak-hold.
 
 **Dual interactive delta cursors** — draggable on both the time and frequency plots,
 with a live readout of each cursor's position and the delta between them (ΔT is also
@@ -210,7 +269,151 @@ paused.
 **Link health** (live mode only) — packet-level CRC pass/fail counters, shown in the
 sidebar and turning red the moment any corruption is detected.
 
-**CSV export** — snapshots the full time/frequency arrays plus every computed metric.
+**Export** — CSV (full time/frequency arrays plus every computed metric), PNG, SVG,
+or a 2-page PDF report (readings as text on page 1, all visible plots on page 2).
+
+## How the measurements work
+
+The formulas below are transcribed from what `src/FFT.py` actually computes (function
+names in parentheses), not generic textbook copies — variable names match the code.
+
+### Coherent-gain amplitude scaling
+
+Every magnitude reading starts from a windowed FFT bin, rescaled back to a real
+amplitude:
+
+$$\text{mag\_scale} = \frac{2}{\sum_n w[n]}, \qquad A = |X[k]| \cdot \text{mag\_scale}$$
+
+For a sinusoid of amplitude $A$ landing exactly on bin $k$, the windowed FFT satisfies
+$|X[k]| = A \cdot \sum_n w[n] / 2$ — so multiplying by `mag_scale` exactly undoes both
+the window's own gain ($\div \sum w[n]$) and the fact that `rfft` only returns the
+positive-frequency half of a real signal's (otherwise symmetric) spectrum, so each bin
+carries only half the tone's total energy ($\times 2$). Verified in `tests/` to
+recover the injected amplitude to float precision for a bin-aligned tone, for every
+window function offered.
+
+### Parabolic (quadratic) peak interpolation (`parabolic_interpolation`)
+
+FFT bins are coarse — a tone rarely lands exactly on one. Fitting a parabola through
+the peak bin $\beta$ and its two neighbors $\alpha, \gamma$ (in dB) gives a sub-bin
+estimate:
+
+$$p = \frac{1}{2} \cdot \frac{\alpha - \gamma}{\alpha - 2\beta + \gamma}, \qquad
+\text{peak\_bin} = k + p, \qquad
+\text{peak\_val} = \beta - \frac{1}{4}(\alpha - \gamma)\,p$$
+
+This is the standard Jacobsen-style quadratic estimator used throughout spectral
+analysis — accurate to a small fraction of a bin as long as the window's main lobe is
+locally well-approximated by a parabola (true for every window this app offers).
+
+### SNR, SINAD, ENOB, THD, SFDR
+
+Given the power spectrum $P[k] = |X[k]|^2$ (after amplitude scaling):
+
+- **SNR** (`compute_snr`) excludes DC, the fundamental, and (if given) one harmonic,
+  then compares the fundamental to the *average* power of everything left — a noise
+  **floor**, not total noise power:
+  $$\text{SNR}_{dB} = 10 \log_{10}\!\left(\frac{P[\text{peak}]}{\text{mean}(P[\text{mask}])}\right)$$
+- **SINAD** (`compute_sinad`) excludes only DC and the fundamental — harmonics stay
+  *in* the denominator, and it's a **sum**, not a mean, since it wants total
+  noise-plus-distortion power:
+  $$\text{SINAD}_{dB} = 10 \log_{10}\!\left(\frac{P[\text{peak}]}{\sum P[\text{mask}]}\right)$$
+- **ENOB** (`compute_enob`) is the standard SINAD → effective-bits conversion, derived
+  from an ideal $N$-bit quantizer's theoretical SINAD ceiling ($6.02N + 1.76$ dB):
+  $$\text{ENOB} = \frac{\text{SINAD}_{dB} - 1.76}{6.02}$$
+- **THD** (`compute_thd`) is the RMS of the located harmonics relative to the
+  fundamental's amplitude:
+  $$\text{THD} = \frac{\sqrt{\sum_h \text{mag}[h]^2}}{\text{mag}[\text{fund}]}$$
+  Reports `n/a` (not a misleadingly-clean `0%`) once the fundamental is high enough
+  that even the 2nd harmonic falls above Nyquist — there's no harmonic content left in
+  the sampled band to measure, a hard physical limit of FFT analysis.
+- **SFDR** (`compute_sfdr`) is simply the dB gap between the fundamental and the next-
+  largest independent spectral component, whatever it is (harmonic, unrelated tone, or
+  noise) — $\infty$ if nothing else is found above the numerical noise floor.
+
+### Noise Analysis: amplitude spectral density (`compute_noise_metrics`)
+
+Converting a bin's power back to a proper power spectral density needs the window's
+**noise gain**, $\sum_n w[n]^2$ — a different normalization than the *coherent* gain
+($\sum_n w[n]$) used for tone amplitudes above. Conflating the two overstated the
+integrated RMS noise by ~40% in early testing before this distinction was made
+explicit in the code:
+
+$$\text{PSD}[k] = \frac{P_{\text{avg}}[k]}{\text{mag\_scale}^2} \cdot
+\frac{2}{f_s \cdot \sum_n w[n]^2}, \qquad \Delta f = \frac{f_s}{N}$$
+
+From that one-sided PSD (V²/Hz), three related readings over the noise-only bins:
+
+$$\text{density} = \sqrt{\text{mean}(\text{PSD})}\ \left[\text{V}/\sqrt{\text{Hz}}\right]
+\qquad
+\text{integrated} = \sqrt{\sum \text{PSD} \cdot \Delta f}\ \left[\text{V}_{\text{RMS}}\right]$$
+
+`integrated` is what a true-RMS meter looking at just the noise would read; `density`
+is what you'd compare against a datasheet noise spec. Verified against synthetic white
+noise of a known RMS level: `integrated` converged within ~1–5% of the injected value.
+
+### Cepstrum Analysis (`compute_real_cepstrum`, `find_cepstrum_peak`)
+
+The real cepstrum is, informally, "the spectrum of a spectrum":
+
+$$c[n] = \text{Re}\big(\text{IFFT}(\log|\text{FFT}(x)|)\big)$$
+
+A strong peak at quefrency $\tau$ means the *log-magnitude spectrum itself* has
+periodic structure with period $1/\tau$ — evenly-spaced harmonics (a fundamental
+pitch period) or a delayed copy of the signal added to itself (an echo) — information
+a plain magnitude spectrum conflates with the general spectral envelope shape. The
+first few low-quefrency samples are skipped when searching for the peak, since they
+reflect that slowly-varying envelope, not periodicity.
+
+Implementation note: rather than run a second full-length FFT, `compute_real_cepstrum`
+mirrors the already-computed `rfft` half-spectrum via conjugate symmetry before the
+(unavoidable) inverse FFT — verified bit-identical (to `~1e-9`) against the textbook
+two-FFT definition in `tests/`.
+
+### Goertzel Analyzer (`compute_goertzel`)
+
+The classic Goertzel algorithm evaluates one DFT bin via a 2nd-order IIR recursion,
+avoiding a full FFT's $O(N\log N)$ cost on hardware where per-sample multiplies are
+cheap and a full FFT isn't:
+
+$$q[n] = 2\cos(\omega)\,q[n-1] - q[n-2] + x[n], \qquad \omega = \frac{2\pi k}{N}$$
+
+evaluated for $n = 0 \ldots N-1$ starting from $q[-1]=q[-2]=0$, with the final complex
+DFT value recovered from $q[N-1]$ and $q[N-2]$. This app computes the mathematically
+identical result — both are the exact DFT coefficient $X(k)$ at the same bin — via one
+vectorized dot product instead of a per-sample loop, which is faster in numpy than the
+recursion would be in pure Python. The key property either form gives you: $k$ need
+not be an integer, so a specific frequency of interest (mains hum, a known tone) can
+be measured *exactly*, not snapped to the FFT's fixed $f_s/N$ bin grid.
+
+### Duty Cycle Analyzer: threshold-crossing interpolation (`_threshold_crossings`)
+
+Sub-sample-accurate edge timing via linear interpolation between the two samples
+straddling a threshold level $L$:
+
+$$\text{frac} = \frac{L - y_0}{y_1 - y_0}, \qquad t_{\text{crossing}} = \frac{i + \text{frac}}{f_s}$$
+
+50% crossings give period, frequency, duty cycle, pulse width, and HIGH/LOW time;
+10%/90% crossings on the same edge give rise/fall time — the same convention a real
+oscilloscope uses.
+
+### Spectrum trace averaging
+
+The displayed spectrum (and every reading derived from it) is an exponential moving
+average **in power**, not dB:
+
+$$P_{\text{avg}}[n] = P_{\text{avg}}[n-1] + \alpha \big(P_{\text{inst}}[n] - P_{\text{avg}}[n-1]\big), \qquad \alpha = 1 - \frac{\text{averaging}}{100}$$
+
+Averaging happens before the $10\log_{10}$ conversion to dB, since averaging
+already-logarithmic values is statistically biased (it systematically underestimates
+the true average power) — a subtlety worth calling out because it's an easy mistake
+to make and a common one in ad hoc spectrum-analyzer code.
+
+### CRC-16/CCITT-FALSE
+
+Covered under [Wire protocol](#wire-protocol) above — poly `0x1021`, init `0xFFFF`,
+MSB-first, no reflection, no final XOR; implemented independently in `main.c` and
+`FFT.py` and cross-checked against the standard test vector.
 
 ## Testing
 
@@ -244,6 +447,9 @@ never the real settings a normal run persists.
 - **Spectrogram frequency axis is always linear** — the log-frequency toggle only
   applies to the Frequency domain and Phase spectrum plots, since `ImageItem` doesn't
   support a non-linear axis without resampling the underlying image data.
+- **3D FFT view has no calibrated axes** — `GLViewWidget` has no tick labels, so its
+  axes are rescaled to a fixed visual range rather than real Hz/seconds/dB; read
+  exact values off the 2D spectrogram instead.
 
 ## Project layout
 
