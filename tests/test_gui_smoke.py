@@ -28,6 +28,7 @@ class Args:
     fps = 10
     noise = 0.03
     averaging = 70.0
+    baud = 3000000
 
 
 @pytest.fixture(scope="session")
@@ -56,6 +57,7 @@ def make_window(qapp, tmp_path, monkeypatch):
 
     def _make(args=None):
         win = FFT.FFTBenchWindow(args or Args(), False, None, None, Args.samplerate)
+        FFT._window_refs.append(win)  # matches main()/_on_connect_click's real bookkeeping
         win.show()
         windows.append(win)
         return win
@@ -143,6 +145,76 @@ class TestPerformanceGating:
         assert win.perf_stage_ms["Cepstrum"] > 0.0
         # And the readout it feeds shouldn't be stuck on the placeholder.
         assert win.cepstrum_label.text() != "—"
+
+
+class FakeReader:
+    """Stands in for SerialReader without opening a real port -- just the
+    attributes FFTBenchWindow reads from a live reader."""
+
+    def __init__(self, sample_rate=80000.0):
+        import queue as _queue
+        self.sample_rate = sample_rate
+        self.temp_c = None
+        self.packets_ok = 0
+        self.packets_bad = 0
+        self.sample_queue = _queue.Queue()
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class FakeSerialPortDialog:
+    """Stands in for FFT.SerialPortDialog -- .exec() returns Accepted
+    immediately instead of showing a real (modal, blocking) dialog."""
+
+    def __init__(self, _baud, parent=None):
+        pass
+
+    def exec(self):
+        return QtWidgets.QDialog.DialogCode.Accepted
+
+    reader = FakeReader()
+    port = "COM7"
+
+
+class TestConnectToSerialPort:
+    def test_synthetic_window_shows_connect_button(self, make_window):
+        win = make_window()
+        assert not win.live
+        assert win.connection_label.text() == "Synthetic mode (no hardware)"
+        assert win.connect_button.text() == "Connect to serial port..."
+
+    def test_connect_click_replaces_window_with_a_live_one(self, make_window, monkeypatch):
+        win = make_window()
+        monkeypatch.setattr(FFT, "SerialPortDialog", FakeSerialPortDialog)
+
+        assert win in FFT._window_refs
+        win._on_connect_click()
+
+        assert win not in FFT._window_refs  # old window closed and unregistered
+        new_win = FFT._window_refs[-1]
+        try:
+            assert new_win.live
+            assert new_win.port_label == "COM7"
+            assert new_win.fs == 80000.0
+            assert new_win.connection_label.text() == "Connected: COM7 @ 80000 Hz"
+            assert new_win.connect_button.text() == "Change port..."
+        finally:
+            new_win.close()  # not tracked by make_window's own cleanup
+
+        assert new_win not in FFT._window_refs
+
+    def test_declining_the_dialog_leaves_the_window_untouched(self, make_window, monkeypatch):
+        class DecliningDialog(FakeSerialPortDialog):
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Rejected
+
+        win = make_window()
+        monkeypatch.setattr(FFT, "SerialPortDialog", DecliningDialog)
+        win._on_connect_click()
+        assert not win.live
+        assert win in FFT._window_refs
 
 
 class TestModes:

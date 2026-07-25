@@ -233,6 +233,15 @@ class SerialReader:
 CONNECT_TIMEOUT_S = 6.0  # ESP32 reboots on port-open + runs a 1s rate
                           # measurement before its first META packet.
 
+# Switching serial port from the running app (see FFTBenchWindow._on_connect_click)
+# replaces the whole window rather than mutating one in place -- fs-dependent state
+# (self.freqs, spectrogram history sizing, etc.) is only ever derived once, in
+# __init__, so building a fresh window reuses that already-correct path instead of
+# duplicating it. PyQt doesn't keep a shown top-level widget alive on its own; this
+# list is what stops the replacement window from being garbage-collected out from
+# under the user the moment _on_connect_click() returns.
+_window_refs = []
+
 
 class SerialPortDialog(QtWidgets.QDialog):
     """Qt dialog to pick a serial port and connect to the ESP32.
@@ -1036,6 +1045,7 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.args = args
         self.live = live
         self.reader = reader
+        self.port_label = port_label
         self.fs = fs
 
         self.window_size = args.window
@@ -1298,6 +1308,29 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         mode_label.setObjectName("modeLabel")
         mode_label.setWordWrap(True)
         layout.addWidget(mode_label)
+
+        # -- Connection -- always visible (not inside a collapsible
+        # section), since picking/changing the serial port is a primary
+        # action, not a tweak -- reachable from a synthetic-mode session
+        # (to connect to hardware for the first time) just as much as
+        # from an already-live one (to switch boards/ports).
+        if self.live:
+            connection_text = f"Connected: {self.port_label} @ {self.fs:.0f} Hz"
+            connect_button_text = "Change port..."
+        else:
+            connection_text = "Synthetic mode (no hardware)"
+            connect_button_text = "Connect to serial port..."
+        self.connection_label = QtWidgets.QLabel(connection_text)
+        self.connection_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self.connection_label.setWordWrap(True)
+        layout.addWidget(self.connection_label)
+        self.connect_button = QtWidgets.QPushButton(connect_button_text)
+        self.connect_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.connect_button.clicked.connect(self._on_connect_click)
+        if serial is None:
+            self.connect_button.setEnabled(False)
+            self.connect_button.setToolTip("Requires pyserial: pip install pyserial")
+        layout.addWidget(self.connect_button)
 
         # -- Graphs ----------------------------------------------------
         graphs_layout = self._make_collapsible_section(layout, "Graphs", start_expanded=True)
@@ -2236,6 +2269,31 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         painter.drawPixmap(page_rect.left(), page_rect.top(), scaled)
         painter.end()
 
+    def _on_connect_click(self):
+        """Opens the same GUI port picker `--serial` (with no port given)
+        shows at startup, but reachable from an already-running window --
+        so a synthetic-mode session can connect to hardware, or a live
+        one can switch boards/ports, without restarting the app.
+
+        On success, builds a brand-new FFTBenchWindow in live mode (the
+        exact same construction path main() uses) rather than mutating
+        this one in place: window_size/fs-derived state (self.freqs,
+        spectrogram history sizing, the quefrency axis, ...) is only ever
+        computed once, in __init__, and re-deriving all of it correctly
+        here would just be duplicating that logic with more risk of
+        drifting out of sync. This window's closeEvent() stops its own
+        reader (if it had one) and unregisters itself from _window_refs.
+        """
+        dialog = SerialPortDialog(self.args.baud, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        reader, port_label = dialog.reader, dialog.port
+        fs = float(reader.sample_rate)
+        new_window = FFTBenchWindow(self.args, True, reader, port_label, fs)
+        _window_refs.append(new_window)
+        new_window.show()
+        self.close()
+
     def _on_pause_click(self):
         self.paused = not self.paused
         if self.paused:
@@ -2674,6 +2732,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self._save_settings()
         if self.live and self.reader is not None:
             self.reader.stop()
+        if self in _window_refs:
+            _window_refs.remove(self)
         super().closeEvent(event)
 
 
@@ -2746,6 +2806,7 @@ def main():
             fs = float(reader.sample_rate)
 
     window = FFTBenchWindow(args, live, reader, port_label, fs)
+    _window_refs.append(window)
     window.show()
     sys.exit(app.exec())
 

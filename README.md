@@ -129,6 +129,13 @@ python src/FFT.py --serial COM5         # or connect directly
 python src/FFT.py --serial /dev/ttyUSB0 --baud 3000000
 ```
 
+You don't need to know the port up front, or even start with `--serial` at all — every
+window (synthetic or live) has a **Connect to serial port... / Change port...** button
+at the top of the sidebar that opens the same GUI port picker. Choosing a port there
+opens a new live window in its place (the old one closes), so you can start in
+synthetic mode and connect to hardware later, or switch boards/ports, without
+restarting the app from the command line.
+
 Run standalone with a synthetic test signal (no hardware needed):
 
 ```
@@ -246,6 +253,12 @@ Core / Trends / Advanced clusters with hover tooltips; every graph defaults to
 **hidden** at launch (see the performance note below), and the last-used layout,
 FFT window, averaging, log-axis, drift metric, and Goertzel targets are remembered
 across restarts (`QSettings`).
+
+**Connect from within the app** — a **Connect to serial port... / Change port...**
+button at the top of the sidebar (in every window, synthetic or live) opens the same
+GUI port picker `--serial` shows at startup. Picking a port opens a new live window
+in place of the current one — so you can start the app with no arguments at all and
+connect to hardware afterward, or switch boards/ports mid-session, without a restart.
 
 **Performance: hidden panels cost (close to) nothing** — Cepstrum, Goertzel, the 2D
 spectrogram, the 3D waterfall, and the Performance Benchmark/CPU-RAM panels
@@ -450,7 +463,8 @@ never the real settings a normal run persists.
   single-shot capture (Pause + cursors are the closest substitute today).
 - **No auto-reconnect**: if the board resets or the USB link drops mid-session, the
   display just freezes with no automatic retry (the Link health counters will show
-  the packet flow having stopped).
+  the packet flow having stopped) — use **Change port...** in the sidebar to
+  reconnect manually.
 - **Spectrogram frequency axis is always linear** — the log-frequency toggle only
   applies to the Frequency domain and Phase spectrum plots, since `ImageItem` doesn't
   support a non-linear axis without resampling the underlying image data.
