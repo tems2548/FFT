@@ -968,6 +968,7 @@ ACCENT_GOERTZEL = "#fb923c"
 ACCENT_DUTY = "#a3e635"
 ACCENT_CPU = "#fbbf24"
 ACCENT_RAM = "#60a5fa"
+ACCENT_TRIGGER = "#ef4444"
 
 # One color per Performance Benchmark stage -- reuses each feature's own
 # accent color where there's a natural match (Cepstrum/Goertzel), so the
@@ -1005,6 +1006,7 @@ QLabel#statsLabel {{
     padding: 10px;
 }}
 QLabel#modeLabel {{ color: #9ca3af; font-size: 12px; }}
+QLabel#appTitle {{ font-size: 18px; font-weight: 700; color: {TEXT_FG}; }}
 QLabel#dialogStatus {{ color: #9ca3af; }}
 QComboBox, QLineEdit {{
     background: {PANEL_BG};
@@ -1020,13 +1022,54 @@ QPushButton {{
 }}
 QPushButton:hover {{ background: #262c3a; }}
 QPushButton:disabled {{ color: #5b6472; }}
-QPushButton#saveButton {{ background: #16321f; border-color: #1f5c34; }}
+QPushButton#saveButton {{ background: #16321f; border-color: #1f5c34; font-weight: 600; }}
 QPushButton#saveButton:hover {{ background: #1b3f27; }}
+QPushButton#primaryButton {{
+    background: {ACCENT_TIME};
+    border: 1px solid #2563eb;
+    color: #0b0f17;
+    font-weight: 600;
+}}
+QPushButton#primaryButton:hover {{ background: #5a95f7; }}
+QPushButton#primaryButton:disabled {{ background: #1f2430; border-color: #2f3542; color: #5b6472; }}
+QPushButton#ghostButton {{
+    background: transparent;
+    border: 1px solid #2f3542;
+    color: {GRID_FG};
+    padding: 5px 10px;
+}}
+QPushButton#ghostButton:hover {{ background: #1c2029; color: {TEXT_FG}; }}
 QSlider::groove:horizontal {{ height: 4px; background: #2a2f3b; border-radius: 2px; }}
 QSlider::handle:horizontal {{
     background: {ACCENT_TIME};
     width: 14px; height: 14px; margin: -6px 0; border-radius: 7px;
 }}
+QCheckBox {{ spacing: 8px; padding: 2px 0; }}
+QCheckBox::indicator {{
+    width: 15px; height: 15px;
+    border: 1px solid #3a4152;
+    border-radius: 4px;
+    background: {PANEL_BG};
+}}
+QCheckBox::indicator:hover {{ border-color: {ACCENT_TIME}; }}
+QCheckBox::indicator:checked {{ background: {ACCENT_TIME}; border-color: {ACCENT_TIME}; }}
+QCheckBox:disabled {{ color: #5b6472; }}
+QFrame#sectionCard {{
+    background: {PANEL_BG};
+    border: 1px solid #262b36;
+    border-radius: 8px;
+}}
+QFrame#plotCard {{
+    background: {PANEL_BG};
+    border: 1px solid #262b36;
+    border-radius: 8px;
+}}
+QScrollArea {{ border: none; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: #2f3542; border-radius: 5px; min-height: 24px; }}
+QScrollBar::handle:vertical:hover {{ background: #3a4152; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
 """
 
 
@@ -1037,6 +1080,34 @@ def apply_plot_theme(plot_item, title, xlabel, ylabel):
     plot_item.showGrid(x=True, y=True, alpha=0.25)
     plot_item.getAxis("bottom").setTextPen(GRID_FG)
     plot_item.getAxis("left").setTextPen(GRID_FG)
+
+
+def build_app_icon():
+    """Small spectrum-bars glyph, drawn in code rather than loaded from an
+    image file so the app has a real window/taskbar icon without shipping
+    a binary asset alongside a single-file script."""
+    size = 64
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+    painter.setBrush(QtGui.QColor(BG))
+    painter.drawRoundedRect(0, 0, size, size, 14, 14)
+
+    bar_heights = [0.35, 0.6, 0.9, 0.55, 0.75]
+    bar_colors = [ACCENT_TIME, ACCENT_FREQ, ACCENT_SNR, ACCENT_PHASE, ACCENT_FREQ]
+    margin, gap = 10, 5
+    n = len(bar_heights)
+    bar_w = (size - 2 * margin - gap * (n - 1)) / n
+    for i, (h_frac, color) in enumerate(zip(bar_heights, bar_colors)):
+        bar_h = (size - 2 * margin) * h_frac
+        x = margin + i * (bar_w + gap)
+        y = size - margin - bar_h
+        painter.setBrush(QtGui.QColor(color))
+        painter.drawRoundedRect(QtCore.QRectF(x, y, bar_w, bar_h), 2, 2)
+    painter.end()
+    return QtGui.QIcon(pixmap)
 
 
 class FFTBenchWindow(QtWidgets.QMainWindow):
@@ -1149,8 +1220,24 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
 
         self.dsp_lab_mode = False
 
+        # Oscilloscope trigger for the Time domain plot only -- FFT and every
+        # other analysis keep running continuously off the live rolling
+        # buffer regardless of trigger state (see _update_trigger), exactly
+        # as before triggering was added; only the trace fed to
+        # self.time_curve is affected.
+        self.trigger_mode = "Free Run"  # "Free Run" | "Normal" | "Single"
+        self.trigger_edge = "Rising"  # "Rising" | "Falling"
+        self.trigger_level = 0.0
+        self.trigger_pretrigger_pct = 50.0
+        self.trigger_armed = True
+        self._trigger_phase = "searching"  # "searching" | "filling"
+        self._trigger_still_needed = 0
+        self._trigger_prev_sample = 0.0
+        self.scope_capture = None
+
         title = f"FFT Test Bench — Live ESP32 ADC ({port_label} @ {fs:.0f} Hz)" if live else "FFT Test Bench"
         self.setWindowTitle(title)
+        self.setWindowIcon(build_app_icon())
         self._build_ui(title)
         self._setup_shortcuts()
 
@@ -1196,9 +1283,13 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         window_name = s.value("spectrum/fft_window")
         if window_name in WINDOW_FUNCTIONS:
             self.window_combo.setCurrentText(window_name)
-        averaging = s.value("spectrum/averaging", type=int, defaultValue=None)
-        if averaging is not None:
-            self.averaging_slider.setValue(averaging)
+        # s.value(key, type=X, defaultValue=None) is NOT a reliable "missing
+        # key" check under PyQt6 -- it coerces a missing value to X's
+        # zero-value (0, 0.0, ...) instead of returning None, silently
+        # zeroing this on a fresh install where the key was never written.
+        # s.contains() + an explicit conversion sidesteps that.
+        if s.contains("spectrum/averaging"):
+            self.averaging_slider.setValue(int(s.value("spectrum/averaging")))
         log_axis = s.value("spectrum/log_axis")
         if log_axis is not None:
             self.log_axis_checkbox.setChecked(str(log_axis).lower() == "true")
@@ -1213,6 +1304,17 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
             self.goertzel_freqs_edit.setText(goertzel_targets_text)
             self._on_goertzel_targets_change()
 
+        # Trigger mode itself is deliberately not restored -- always starts
+        # on Free Run so a forgotten Single-mode setting from last session
+        # can't leave the Time domain plot looking silently stuck on launch.
+        trigger_edge = s.value("trigger/edge")
+        if trigger_edge in ("Rising", "Falling"):
+            self.trigger_edge_combo.setCurrentText(trigger_edge)
+        if s.contains("trigger/level"):
+            self.trigger_level_slider.setValue(int(round(float(s.value("trigger/level")) * 100)))
+        if s.contains("trigger/pretrigger_pct"):
+            self.trigger_pretrigger_slider.setValue(int(round(float(s.value("trigger/pretrigger_pct")))))
+
     def _save_settings(self):
         s = self.settings
         s.setValue("window/geometry", self.saveGeometry())
@@ -1224,6 +1326,9 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         s.setValue("spectrum/peak_hold", self.show_peak_hold)
         s.setValue("spectrum/drift_metric", self.drift_metric)
         s.setValue("spectrum/goertzel_targets", self.goertzel_targets_text)
+        s.setValue("trigger/edge", self.trigger_edge)
+        s.setValue("trigger/level", self.trigger_level)
+        s.setValue("trigger/pretrigger_pct", self.trigger_pretrigger_pct)
 
     def _recompute_window(self):
         self.window_func = WINDOW_FUNCTIONS[self.window_name](self.window_size)
@@ -1304,10 +1409,15 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setSpacing(10)
 
-        mode_label = QtWidgets.QLabel(title)
-        mode_label.setObjectName("modeLabel")
-        mode_label.setWordWrap(True)
-        layout.addWidget(mode_label)
+        header_row = QtWidgets.QHBoxLayout()
+        header_row.setSpacing(10)
+        logo_label = QtWidgets.QLabel()
+        logo_label.setPixmap(build_app_icon().pixmap(30, 30))
+        header_row.addWidget(logo_label)
+        app_title_label = QtWidgets.QLabel("FFT Test Bench")
+        app_title_label.setObjectName("appTitle")
+        header_row.addWidget(app_title_label, 1)
+        layout.addLayout(header_row)
 
         # -- Connection -- always visible (not inside a collapsible
         # section), since picking/changing the serial port is a primary
@@ -1325,7 +1435,7 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.connection_label.setWordWrap(True)
         layout.addWidget(self.connection_label)
         self.connect_button = QtWidgets.QPushButton(connect_button_text)
-        self.connect_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.connect_button.setObjectName("primaryButton")
         self.connect_button.clicked.connect(self._on_connect_click)
         if serial is None:
             self.connect_button.setEnabled(False)
@@ -1336,26 +1446,26 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         graphs_layout = self._make_collapsible_section(layout, "Graphs", start_expanded=True)
 
         show_hide_row = QtWidgets.QHBoxLayout()
-        show_all_btn = QtWidgets.QPushButton(" Show All")
-        show_all_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogYesButton))
-        hide_all_btn = QtWidgets.QPushButton(" Hide All")
-        hide_all_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogNoButton))
+        show_all_btn = QtWidgets.QPushButton("Show All")
+        show_all_btn.setObjectName("ghostButton")
+        hide_all_btn = QtWidgets.QPushButton("Hide All")
+        hide_all_btn.setObjectName("ghostButton")
         show_hide_row.addWidget(show_all_btn)
         show_hide_row.addWidget(hide_all_btn)
         graphs_layout.addLayout(show_hide_row)
 
         plot_widgets_by_label = {
-            "Time domain": self.time_plot,
-            "Frequency domain": self.freq_plot,
-            "Phase spectrum": self.phase_plot,
-            "Bode plot": self.bode_plot,
-            "Spectrogram": self.spec_plot,
-            "Noise floor & SNR trend": self.noise_plot,
-            "Drift Analysis": self.drift_plot,
-            "Performance Benchmark": self.perf_plot,
-            "CPU / RAM Usage": self.sysres_plot,
-            "Cepstrum Analysis": self.cepstrum_plot,
-            "Goertzel Analyzer": self.goertzel_plot,
+            "Time domain": self.time_card,
+            "Frequency domain": self.freq_card,
+            "Phase spectrum": self.phase_card,
+            "Bode plot": self.bode_card,
+            "Spectrogram": self.spec_card,
+            "Noise floor & SNR trend": self.noise_card,
+            "Drift Analysis": self.drift_card,
+            "Performance Benchmark": self.perf_card,
+            "CPU / RAM Usage": self.sysres_card,
+            "Cepstrum Analysis": self.cepstrum_card,
+            "Goertzel Analyzer": self.goertzel_card,
             "3D FFT (waterfall)": self.fft3d_plot,
         }
         self._graph_checkboxes = {}
@@ -1439,7 +1549,7 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         )
         peak_hold_row.addWidget(self.peak_hold_checkbox)
         self.peak_hold_reset_button = QtWidgets.QPushButton("Reset")
-        self.peak_hold_reset_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+        self.peak_hold_reset_button.setObjectName("ghostButton")
         self.peak_hold_reset_button.clicked.connect(self._on_peak_hold_reset)
         peak_hold_row.addWidget(self.peak_hold_reset_button)
         spectrum_layout.addLayout(peak_hold_row)
@@ -1456,6 +1566,66 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.cursor_label.setObjectName("statsLabel")
         self.cursor_label.setWordWrap(True)
         spectrum_layout.addWidget(self.cursor_label)
+
+        # -- Trigger -----------------------------------------------------
+        trigger_layout = self._make_collapsible_section(layout, "Trigger", start_expanded=False)
+
+        self.trigger_mode_combo = QtWidgets.QComboBox()
+        self.trigger_mode_combo.addItems(["Free Run", "Normal", "Single"])
+        self.trigger_mode_combo.setCurrentText(self.trigger_mode)
+        self.trigger_mode_combo.currentTextChanged.connect(self._on_trigger_mode_change)
+        self.trigger_mode_combo.setToolTip(
+            "Free Run: live scrolling waveform, no trigger.\n"
+            "Normal: re-triggers continuously, holding each captured\n"
+            "waveform steady until the next qualifying edge completes.\n"
+            "Single: captures once then freezes -- click Arm Single to rearm."
+        )
+        trigger_layout.addWidget(self.trigger_mode_combo)
+
+        edge_row = QtWidgets.QHBoxLayout()
+        edge_row.addWidget(QtWidgets.QLabel("Edge:"))
+        self.trigger_edge_combo = QtWidgets.QComboBox()
+        self.trigger_edge_combo.addItems(["Rising", "Falling"])
+        self.trigger_edge_combo.setCurrentText(self.trigger_edge)
+        self.trigger_edge_combo.currentTextChanged.connect(self._on_trigger_edge_change)
+        edge_row.addWidget(self.trigger_edge_combo)
+        trigger_layout.addLayout(edge_row)
+
+        self.trigger_level_label = QtWidgets.QLabel(f"Level: {self.trigger_level:.2f}")
+        trigger_layout.addWidget(self.trigger_level_label)
+        self.trigger_level_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.trigger_level_slider.setRange(-300, 300)
+        self.trigger_level_slider.setValue(int(round(self.trigger_level * 100)))
+        self.trigger_level_slider.valueChanged.connect(self._on_trigger_level_change)
+        self.trigger_level_slider.setToolTip(
+            "Amplitude the signal must cross to fire the trigger -- drag the\n"
+            "red horizontal line on the Time domain plot directly, or use this slider."
+        )
+        trigger_layout.addWidget(self.trigger_level_slider)
+
+        self.trigger_pretrigger_label = QtWidgets.QLabel(f"Pre-trigger: {self.trigger_pretrigger_pct:.0f}%")
+        trigger_layout.addWidget(self.trigger_pretrigger_label)
+        self.trigger_pretrigger_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.trigger_pretrigger_slider.setRange(0, 100)
+        self.trigger_pretrigger_slider.setValue(int(round(self.trigger_pretrigger_pct)))
+        self.trigger_pretrigger_slider.valueChanged.connect(self._on_trigger_pretrigger_change)
+        self.trigger_pretrigger_slider.setToolTip(
+            "How much of the window is shown before vs. after the trigger point --\n"
+            "drag the red vertical line on the Time domain plot directly, or use this slider."
+        )
+        trigger_layout.addWidget(self.trigger_pretrigger_slider)
+
+        self.trigger_arm_button = QtWidgets.QPushButton("Arm Single")
+        self.trigger_arm_button.setObjectName("ghostButton")
+        self.trigger_arm_button.clicked.connect(self._on_trigger_arm_click)
+        trigger_layout.addWidget(self.trigger_arm_button)
+
+        self.trigger_status_label = QtWidgets.QLabel("")
+        self.trigger_status_label.setStyleSheet("color: #9ca3af; font-size: 11px;")
+        self.trigger_status_label.setWordWrap(True)
+        trigger_layout.addWidget(self.trigger_status_label)
+
+        self._update_trigger_controls_enabled()
 
         # -- Waveform (synthetic mode only) -------------------------------
         waveform_layout = self._make_collapsible_section(layout, "Waveform", start_expanded=True)
@@ -1493,12 +1663,10 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         snapshot_layout = self._make_collapsible_section(layout, "Snapshot & Export", start_expanded=True)
 
         self.pause_button = QtWidgets.QPushButton("Pause  (Space)")
-        self.pause_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPause))
         self.pause_button.clicked.connect(self._on_pause_click)
         snapshot_layout.addWidget(self.pause_button)
         self.save_button = QtWidgets.QPushButton("Save CSV  (Ctrl+S)")
         self.save_button.setObjectName("saveButton")
-        self.save_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
         self.save_button.clicked.connect(self._on_save_click)
         snapshot_layout.addWidget(self.save_button)
         self.save_status_label = QtWidgets.QLabel("")
@@ -1510,7 +1678,6 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.export_format_combo.addItems(["PNG", "SVG", "PDF report"])
         export_row.addWidget(self.export_format_combo)
         self.export_button = QtWidgets.QPushButton("Export  (Ctrl+E)")
-        self.export_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowDown))
         self.export_button.clicked.connect(self._on_export_click)
         export_row.addWidget(self.export_button)
         snapshot_layout.addLayout(export_row)
@@ -1643,21 +1810,31 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
 
         Returns the QVBoxLayout to populate with this section's content.
         """
+        card = QtWidgets.QFrame()
+        card.setObjectName("sectionCard")
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(10, 8, 10, 10)
+        card_layout.setSpacing(8)
+
         header = QtWidgets.QToolButton()
         header.setText(title)
         header.setCheckable(True)
         header.setChecked(start_expanded)
         header.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         header.setArrowType(QtCore.Qt.ArrowType.DownArrow if start_expanded else QtCore.Qt.ArrowType.RightArrow)
+        header.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         header.setStyleSheet(
-            "QToolButton { border: none; font-weight: 600; font-size: 14px; padding: 2px 0; }"
+            "QToolButton { border: none; background: transparent; font-weight: 600; font-size: 14px; padding: 2px 0; }"
+            f"QToolButton:hover {{ color: {ACCENT_TIME}; }}"
         )
+        card_layout.addWidget(header)
 
         content = QtWidgets.QWidget()
         content_layout = QtWidgets.QVBoxLayout(content)
         content_layout.setContentsMargins(4, 2, 0, 0)
         content_layout.setSpacing(10)
         content.setVisible(start_expanded)
+        card_layout.addWidget(content)
 
         def on_toggled(checked):
             content.setVisible(checked)
@@ -1665,9 +1842,23 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
 
         header.toggled.connect(on_toggled)
 
-        parent_layout.addWidget(header)
-        parent_layout.addWidget(content)
+        parent_layout.addWidget(card)
         return content_layout
+
+    def _wrap_plot_card(self, widget):
+        """Frames a plot widget in a bordered card, matching the sidebar's
+        stat boxes/sections, so the plot column reads as a set of distinct
+        panels rather than plots butted directly against each other.
+        Visibility toggled on the card (not the plot widget) hides the
+        whole card, since Qt's isVisible() already reports False for a
+        widget whose ancestor is hidden -- callers gating on e.g.
+        self.spec_plot.isVisible() keep working unchanged."""
+        card = QtWidgets.QFrame()
+        card.setObjectName("plotCard")
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.addWidget(widget)
+        return card
 
     def _build_plots(self):
         pg.setConfigOptions(antialias=True)
@@ -1689,8 +1880,9 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.raw_signal_plot.setXRange(0, self.window_size / self.fs, padding=0)
         self.raw_signal_plot.setYRange(*((-0.2, 3.5) if self.live else (-2.2, 2.2)))
         self.raw_signal_plot.setMinimumHeight(180)
-        self.raw_signal_plot.setVisible(self.dsp_lab_mode)
-        vbox.addWidget(self.raw_signal_plot, 1)
+        self.raw_signal_card = self._wrap_plot_card(self.raw_signal_plot)
+        self.raw_signal_card.setVisible(self.dsp_lab_mode)
+        vbox.addWidget(self.raw_signal_card, 1)
 
         # Time domain (this is, in pipeline terms, stage 2: after DC
         # removal -- the DSP Lab plots on either side of it show stage 1,
@@ -1709,7 +1901,29 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.time_cursor_a, self.time_cursor_b = self._add_delta_cursor_pair(
             self.time_plot, 0, self.window_size / self.fs
         )
-        vbox.addWidget(self.time_plot, 1)
+
+        # Oscilloscope trigger markers: a draggable horizontal line at the
+        # trigger level, and a draggable vertical line at the pre-trigger
+        # position within the window -- both hidden until trigger mode is
+        # something other than Free Run (see _update_trigger_controls_enabled).
+        self.trigger_level_line = pg.InfiniteLine(
+            pos=self.trigger_level, angle=0, movable=True,
+            pen=pg.mkPen(ACCENT_TRIGGER, width=1.5, style=QtCore.Qt.PenStyle.DashLine),
+        )
+        self.trigger_level_line.setVisible(False)
+        self.time_plot.addItem(self.trigger_level_line)
+        self.trigger_level_line.sigPositionChanged.connect(self._on_trigger_level_line_moved)
+
+        self.trigger_position_marker = pg.InfiniteLine(
+            pos=(self.trigger_pretrigger_pct / 100.0) * (self.window_size / self.fs), angle=90, movable=True,
+            pen=pg.mkPen(ACCENT_TRIGGER, width=1.5, style=QtCore.Qt.PenStyle.DashLine),
+        )
+        self.trigger_position_marker.setVisible(False)
+        self.time_plot.addItem(self.trigger_position_marker)
+        self.trigger_position_marker.sigPositionChanged.connect(self._on_trigger_position_marker_moved)
+
+        self.time_card = self._wrap_plot_card(self.time_plot)
+        vbox.addWidget(self.time_card, 1)
 
         # DSP Laboratory Mode, stages 3-4: the signal after the window
         # function is applied -- what actually goes into the FFT. Shows
@@ -1727,8 +1941,9 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.windowed_signal_plot.setXRange(0, self.window_size / self.fs, padding=0)
         self.windowed_signal_plot.setYRange(*((-1.8, 1.8) if self.live else (-2.2, 2.2)))
         self.windowed_signal_plot.setMinimumHeight(180)
-        self.windowed_signal_plot.setVisible(self.dsp_lab_mode)
-        vbox.addWidget(self.windowed_signal_plot, 1)
+        self.windowed_signal_card = self._wrap_plot_card(self.windowed_signal_plot)
+        self.windowed_signal_card.setVisible(self.dsp_lab_mode)
+        vbox.addWidget(self.windowed_signal_card, 1)
 
         # Frequency domain, with a hover crosshair for reading values off
         # the curve (a plain static line is hard to read precisely).
@@ -1749,7 +1964,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.freq_plot.addItem(self.second_peak_marker)
         self._add_crosshair(self.freq_plot, "Hz", "dB")
         self.freq_cursor_a, self.freq_cursor_b = self._add_delta_cursor_pair(self.freq_plot, 0, self.fs / 2)
-        vbox.addWidget(self.freq_plot, 1)
+        self.freq_card = self._wrap_plot_card(self.freq_plot)
+        vbox.addWidget(self.freq_card, 1)
 
         # Phase spectrum, from the raw (unaveraged) FFT bins -- unlike the
         # magnitude trace above, phase can't be power-averaged frame to
@@ -1764,7 +1980,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.phase_plot.setYRange(-180, 180, padding=0)
         self.phase_plot.setMinimumHeight(180)
         self._add_crosshair(self.phase_plot, "Hz", "deg")
-        vbox.addWidget(self.phase_plot, 1)
+        self.phase_card = self._wrap_plot_card(self.phase_plot)
+        vbox.addWidget(self.phase_card, 1)
 
         # Bode plot: magnitude and phase together on one shared frequency
         # axis, classic dual-Y-axis style. This is just a different layout
@@ -1803,7 +2020,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self._sync_bode_views = sync_bode_views  # keep a strong ref alongside the Qt signal connection
         bode_item.vb.sigResized.connect(sync_bode_views)
         sync_bode_views()
-        vbox.addWidget(self.bode_plot, 1)
+        self.bode_card = self._wrap_plot_card(self.bode_plot)
+        vbox.addWidget(self.bode_card, 1)
 
         self._apply_freq_axis_mode()  # needs both freq_plot and phase_plot to exist
 
@@ -1825,7 +2043,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         cbar = pg.ColorBarItem(values=(-100, 20), colorMap=pg.colormap.get("magma"), label="dB")
         cbar.setImageItem(self.spec_image, insert_in=self.spec_plot.getPlotItem())
         self.spec_plot.setMinimumHeight(180)
-        vbox.addWidget(self.spec_plot, 1)
+        self.spec_card = self._wrap_plot_card(self.spec_plot)
+        vbox.addWidget(self.spec_card, 1)
 
         # Noise floor / SNR trend
         self.noise_plot = pg.PlotWidget(background=PANEL_BG)
@@ -1840,7 +2059,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.noise_plot.setXRange(self.noise_time_axis[0], self.noise_time_axis[-1], padding=0)
         self.noise_plot.setYRange(-100, 60, padding=0)
         self.noise_plot.setMinimumHeight(180)
-        vbox.addWidget(self.noise_plot, 1)
+        self.noise_card = self._wrap_plot_card(self.noise_plot)
+        vbox.addWidget(self.noise_card, 1)
 
         # Drift Analysis: rolling history of one selectable metric at a
         # time (frequency/DC bias/noise floor/THD/SINAD/die temperature).
@@ -1854,7 +2074,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.drift_plot.getPlotItem().enableAutoRange(axis=pg.ViewBox.YAxis)
         self.drift_plot.setXRange(self.noise_time_axis[0], self.noise_time_axis[-1], padding=0)
         self.drift_plot.setMinimumHeight(180)
-        vbox.addWidget(self.drift_plot, 1)
+        self.drift_card = self._wrap_plot_card(self.drift_plot)
+        vbox.addWidget(self.drift_card, 1)
 
         # Cepstrum Analysis: IFFT(log|FFT|) of the windowed signal, for
         # spotting periodic structure in the spectrum itself (pitch/
@@ -1870,7 +2091,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.cepstrum_plot.getPlotItem().enableAutoRange(axis=pg.ViewBox.YAxis)
         self.cepstrum_plot.setXRange(self.quefrency_axis[0], self.quefrency_axis[-1], padding=0)
         self.cepstrum_plot.setMinimumHeight(180)
-        vbox.addWidget(self.cepstrum_plot, 1)
+        self.cepstrum_card = self._wrap_plot_card(self.cepstrum_plot)
+        vbox.addWidget(self.cepstrum_card, 1)
 
         # Goertzel Analyzer: exact magnitude at a handful of user-chosen
         # target frequencies, as a small bar chart (a full spectrum trace
@@ -1882,7 +2104,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.goertzel_plot.setMinimumHeight(180)
         self.goertzel_bar_item = None
         self._rebuild_goertzel_bars()
-        vbox.addWidget(self.goertzel_plot, 1)
+        self.goertzel_card = self._wrap_plot_card(self.goertzel_plot)
+        vbox.addWidget(self.goertzel_card, 1)
 
         # 3D FFT waterfall: a rotatable OpenGL perspective on the same
         # rolling time x frequency x magnitude history as the 2D
@@ -1912,7 +2135,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.perf_plot.getPlotItem().enableAutoRange(axis=pg.ViewBox.YAxis)
         self.perf_plot.setXRange(self.noise_time_axis[0], self.noise_time_axis[-1], padding=0)
         self.perf_plot.setMinimumHeight(180)
-        vbox.addWidget(self.perf_plot, 1)
+        self.perf_card = self._wrap_plot_card(self.perf_plot)
+        vbox.addWidget(self.perf_card, 1)
 
         # CPU / RAM usage (this process): dual-axis like the Bode plot
         # above, since the two share no common scale (0-100% vs however
@@ -1946,7 +2170,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self._sync_sysres_views = sync_sysres_views  # keep a strong ref alongside the Qt signal connection
         sysres_item.vb.sigResized.connect(sync_sysres_views)
         sync_sysres_views()
-        vbox.addWidget(self.sysres_plot, 1)
+        self.sysres_card = self._wrap_plot_card(self.sysres_plot)
+        vbox.addWidget(self.sysres_card, 1)
 
         return container
 
@@ -1971,9 +2196,10 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
                 self.fft3d_view = view
                 self.fft3d_surface = surface
 
-                container = QtWidgets.QWidget()
+                container = QtWidgets.QFrame()
+                container.setObjectName("plotCard")
                 layout = QtWidgets.QVBoxLayout(container)
-                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setContentsMargins(6, 6, 6, 6)
                 layout.setSpacing(2)
                 title = QtWidgets.QLabel("3D FFT (waterfall)")
                 title.setStyleSheet(f"color: {TEXT_FG}; font-size: 12pt; font-weight: 600; padding: 4px 2px;")
@@ -1983,13 +2209,17 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
             except Exception as exc:
                 print(f"3D FFT view unavailable ({exc}); showing fallback message instead.")
 
-        placeholder = QtWidgets.QLabel(
+        placeholder = QtWidgets.QFrame()
+        placeholder.setObjectName("plotCard")
+        placeholder_layout = QtWidgets.QVBoxLayout(placeholder)
+        placeholder_label = QtWidgets.QLabel(
             "3D FFT (waterfall) view requires PyOpenGL, which isn't installed\n"
             "(or a usable OpenGL context isn't available on this machine).\n\n"
             "pip install PyOpenGL"
         )
-        placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        placeholder.setStyleSheet(f"color: #6b7280; background: {PANEL_BG}; border-radius: 6px;")
+        placeholder_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        placeholder_label.setStyleSheet("color: #6b7280;")
+        placeholder_layout.addWidget(placeholder_label)
         return placeholder
 
     def _rebuild_goertzel_bars(self):
@@ -2108,8 +2338,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
 
     def _on_dsp_lab_toggle(self, checked):
         self.dsp_lab_mode = checked
-        self.raw_signal_plot.setVisible(checked)
-        self.windowed_signal_plot.setVisible(checked)
+        self.raw_signal_card.setVisible(checked)
+        self.windowed_signal_card.setVisible(checked)
         self.pipeline_section.setVisible(checked)
         self.time_plot.getPlotItem().setTitle(
             "2. Time domain (DC removed)" if checked else "Time domain", color=TEXT_FG, size="12pt"
@@ -2131,6 +2361,134 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         if new_targets != self.goertzel_targets:
             self.goertzel_targets = new_targets
             self._rebuild_goertzel_bars()
+
+    def _on_trigger_mode_change(self, text):
+        self.trigger_mode = text
+        self.trigger_armed = True
+        self._trigger_phase = "searching"
+        self.scope_capture = None
+        self._update_trigger_controls_enabled()
+
+    def _on_trigger_edge_change(self, text):
+        self.trigger_edge = text
+        self._trigger_phase = "searching"
+
+    def _on_trigger_level_change(self, value):
+        self.trigger_level = value / 100.0
+        self.trigger_level_label.setText(f"Level: {self.trigger_level:.2f}")
+        self._trigger_phase = "searching"
+        self.trigger_level_line.blockSignals(True)
+        self.trigger_level_line.setValue(self.trigger_level)
+        self.trigger_level_line.blockSignals(False)
+
+    def _on_trigger_level_line_moved(self):
+        value = float(self.trigger_level_line.value())
+        self.trigger_level = value
+        self.trigger_level_label.setText(f"Level: {value:.2f}")
+        self._trigger_phase = "searching"
+        self.trigger_level_slider.blockSignals(True)
+        self.trigger_level_slider.setValue(int(round(value * 100)))
+        self.trigger_level_slider.blockSignals(False)
+
+    def _on_trigger_pretrigger_change(self, value):
+        self.trigger_pretrigger_pct = float(value)
+        self.trigger_pretrigger_label.setText(f"Pre-trigger: {value:.0f}%")
+        self._trigger_phase = "searching"
+        self.trigger_position_marker.blockSignals(True)
+        self.trigger_position_marker.setValue((value / 100.0) * (self.window_size / self.fs))
+        self.trigger_position_marker.blockSignals(False)
+
+    def _on_trigger_position_marker_moved(self):
+        window_duration = self.window_size / self.fs
+        frac = min(max(float(self.trigger_position_marker.value()) / window_duration, 0.0), 1.0)
+        pct = frac * 100.0
+        self.trigger_pretrigger_pct = pct
+        self.trigger_pretrigger_label.setText(f"Pre-trigger: {pct:.0f}%")
+        self._trigger_phase = "searching"
+        self.trigger_pretrigger_slider.blockSignals(True)
+        self.trigger_pretrigger_slider.setValue(int(round(pct)))
+        self.trigger_pretrigger_slider.blockSignals(False)
+
+    def _on_trigger_arm_click(self):
+        self.trigger_armed = True
+        self._trigger_phase = "searching"
+
+    def _update_trigger_controls_enabled(self):
+        enabled = self.trigger_mode != "Free Run"
+        for w in (self.trigger_edge_combo, self.trigger_level_slider, self.trigger_pretrigger_slider):
+            w.setEnabled(enabled)
+        self.trigger_arm_button.setEnabled(self.trigger_mode == "Single")
+        self.trigger_level_line.setVisible(enabled)
+        self.trigger_position_marker.setVisible(enabled)
+        if not enabled:
+            self.trigger_status_label.setText("")
+
+    def _finalize_trigger_capture(self, display_buffer):
+        self.scope_capture = display_buffer.copy()
+        self._trigger_phase = "searching"
+        if self.trigger_mode == "Single":
+            self.trigger_armed = False
+
+    def _update_trigger_status_label(self):
+        if not self.trigger_armed:
+            self.trigger_status_label.setText("Captured (frozen) -- click Arm Single to continue")
+        elif self._trigger_phase == "filling":
+            self.trigger_status_label.setText("Triggered -- filling post-trigger buffer...")
+        else:
+            self.trigger_status_label.setText(
+                f"Armed -- waiting for {self.trigger_edge.lower()} edge at {self.trigger_level:.2f}"
+            )
+
+    def _update_trigger(self, display_buffer, n_new):
+        """Oscilloscope-style trigger for the Time domain plot only (see the
+        comment on self.trigger_mode in __init__ for why FFT/analysis don't
+        freeze too).
+
+        Free Run: passes the live buffer straight through.
+        Normal/Single: waits for a level-crossing edge in the newly arrived
+        samples, then lets the buffer's natural scroll carry that sample to
+        the desired horizontal (pre-trigger%) position before snapshotting
+        -- since self.buffer already always holds exactly the last
+        window_size samples, waiting for exactly
+        `window_size * (1 - pretrigger%)` more samples to arrive after the
+        edge is detected does this with no extra history buffer needed.
+        Normal re-arms immediately after each capture (continuous
+        retriggering, holding the previous capture steady in the meantime,
+        like a real scope); Single freezes until re-armed via the button.
+        """
+        if self.trigger_mode == "Free Run":
+            return display_buffer
+
+        if n_new == 0:
+            return self.scope_capture if self.scope_capture is not None else display_buffer
+
+        if self.trigger_armed:
+            if self._trigger_phase == "searching":
+                tail = display_buffer[-n_new:]
+                chunk = np.concatenate(([self._trigger_prev_sample], tail))
+                if self.trigger_edge == "Rising":
+                    crossings = np.flatnonzero((chunk[:-1] < self.trigger_level) & (chunk[1:] >= self.trigger_level))
+                else:
+                    crossings = np.flatnonzero((chunk[:-1] > self.trigger_level) & (chunk[1:] <= self.trigger_level))
+                if len(crossings):
+                    local_idx = int(crossings[0])  # first qualifying edge only
+                    crossing_buffer_idx = self.window_size - n_new + local_idx
+                    samples_after_in_buffer = (self.window_size - 1) - crossing_buffer_idx
+                    target_post = int(round(self.window_size * (1 - self.trigger_pretrigger_pct / 100.0)))
+                    still_needed = target_post - samples_after_in_buffer
+                    if still_needed <= 0:
+                        self._finalize_trigger_capture(display_buffer)
+                    else:
+                        self._trigger_phase = "filling"
+                        self._trigger_still_needed = still_needed
+            elif self._trigger_phase == "filling":
+                self._trigger_still_needed -= n_new
+                if self._trigger_still_needed <= 0:
+                    self._finalize_trigger_capture(display_buffer)
+
+        self._trigger_prev_sample = float(display_buffer[-1])
+        self._update_trigger_status_label()
+        return self.scope_capture if self.scope_capture is not None else display_buffer
 
     def _on_cursors_toggle(self, checked):
         self.show_cursors = checked
@@ -2298,12 +2656,10 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         self.paused = not self.paused
         if self.paused:
             self.pause_button.setText("Resume  (Space)")
-            self.pause_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
-            self.pause_button.setStyleSheet(f"background: {ACCENT_FREQ}; border-color: {ACCENT_FREQ}; color: #111;")
+            self.pause_button.setStyleSheet(f"background: {ACCENT_FREQ}; border-color: {ACCENT_FREQ}; color: #111; font-weight: 600;")
             self.fps_label.setText("PAUSED")
         else:
             self.pause_button.setText("Pause  (Space)")
-            self.pause_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPause))
             self.pause_button.setStyleSheet("")
             self.last_frame_time = None  # don't count the paused interval as a slow frame
 
@@ -2357,7 +2713,8 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
         # window's mean AC-couples it in software.
         dc_bias = self.buffer.mean()
         display_buffer = self.buffer - dc_bias if self.live else self.buffer
-        self.time_curve.setData(self.t_axis, display_buffer)
+        scope_trace = self._update_trigger(display_buffer, n_new)
+        self.time_curve.setData(self.t_axis, scope_trace)
 
         windowed_signal = display_buffer * self.window_func
         if self.dsp_lab_mode:
@@ -2620,12 +2977,17 @@ class FFTBenchWindow(QtWidgets.QMainWindow):
                 z = self.spec_history[:, :: self.gl3d_freq_stride].T  # (n_freq_ds, SPECTROGRAM_HISTORY)
                 z_norm = np.clip((z + 100.0) / 120.0, 0.0, 1.0)  # -100..20 dB -> 0..1
                 colors = self.fft3d_colormap.map(z_norm, mode="float")
-                # Axes rescaled to a common ~0-10 visual range purely so the
+                # Axes rescaled to a common ~-5..5 visual range purely so the
                 # surface reads as a legible 3D shape -- GLViewWidget has no
                 # tick labels, so this view is a qualitative companion to the
                 # calibrated 2D spectrogram above, not a substitute for it.
-                x_display = self.freqs[:: self.gl3d_freq_stride] / max(self.fs / 2, 1e-9) * 10.0
-                y_display = (self.noise_time_axis - self.noise_time_axis[0]) / max(-self.noise_time_axis[0], 1e-9) * 10.0
+                # Centered on the origin (rather than 0..10) to line up with
+                # GLGridItem's floor, which is also centered on the origin --
+                # otherwise the surface sat almost entirely outside the grid
+                # and off to one side of the camera's look-at point, so it
+                # only ever appeared edge-on instead of as a legible 3D shape.
+                x_display = self.freqs[:: self.gl3d_freq_stride] / max(self.fs / 2, 1e-9) * 10.0 - 5.0
+                y_display = (self.noise_time_axis - self.noise_time_axis[0]) / max(-self.noise_time_axis[0], 1e-9) * 10.0 - 5.0
                 z_display = z_norm * 4.0
                 self.fft3d_surface.setData(x=x_display, y=y_display, z=z_display, colors=colors)
 
@@ -2776,6 +3138,7 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
+    app.setWindowIcon(build_app_icon())
 
     live = args.serial is not None
     reader = None
