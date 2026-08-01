@@ -1,19 +1,39 @@
 # ESP32-S3 Live FFT Spectrum Analyzer
 
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![Qt](https://img.shields.io/badge/UI-PyQt6%20%2F%20pyqtgraph-41cd52)
+![Firmware](https://img.shields.io/badge/firmware-ESP--IDF%20%2F%20PlatformIO-orange)
+![Tests](https://img.shields.io/badge/tests-pytest-0a9edc)
+
 A two-part tool for turning an ESP32-S3 into a USB-tethered oscilloscope / spectrum
 analyzer / signal quality meter:
 
 - **`src/main.c`** — ESP-IDF firmware that samples an analog input via the ADC's
   continuous (DMA) mode, decimates it to a manageable rate, and streams calibrated
   voltage samples to a PC over the same USB-UART used for flashing/logging.
-- **`src/FFT.py`** — A PyQt6 + pyqtgraph desktop app that receives that stream (or
-  generates a synthetic test signal instead) and renders a live multi-panel
+- **`src/FFT_Visualize/`** — A PyQt6 + pyqtgraph desktop app that receives that stream
+  (or generates a synthetic test signal instead) and renders a live multi-panel
   time-domain / frequency-domain / spectrogram / phase display, plus a full panel of
   standard signal-quality measurements (SNR, SINAD, ENOB, THD, SFDR, harmonics, ...).
 
-Also works with **no hardware at all** — `FFT.py` doubles as a self-contained FFT test
+Also works with **no hardware at all** — it doubles as a self-contained FFT test
 bench with synthetic waveforms (sine/chirp/square/sawtooth/demo), useful for learning
 FFT/DSP concepts or exercising the visualizer on its own.
+
+![Screenshot of the FFT test bench showing the time domain, frequency domain, spectrogram, and noise floor/SNR trend panels](docs/screenshot.png)
+
+## Contents
+
+- [Hardware](#hardware)
+- [Architecture](#architecture)
+- [Wire protocol](#wire-protocol)
+- [Firmware setup](#firmware-setup)
+- [Python visualizer setup](#python-visualizer-setup)
+- [Features](#features)
+- [How the measurements work](#how-the-measurements-work)
+- [Testing](#testing)
+- [Known limitations](#known-limitations)
+- [Project layout](#project-layout)
 
 ## Hardware
 
@@ -28,7 +48,7 @@ AC-couples it in software and reports the removed bias separately (see
 
 ## Architecture
 
-```
+```text
  [Analog signal] -> GPIO7 -> ESP32-S3 ADC (continuous/DMA mode, ~80 kHz raw)
                                    |
                        decimate (average) + calibrate to mV
@@ -39,7 +59,7 @@ AC-couples it in software and reports the removed bias separately (see
                                    |
                               [USB cable]
                                    |
-                   FFT.py: SerialReader (background thread)
+              protocol.py: SerialReader (background thread)
                                    |
                     PyQt6 / pyqtgraph live multi-panel UI
 ```
@@ -59,7 +79,7 @@ All multi-byte fields are little-endian (native ESP32 byte order).
 
 CRC is **CRC-16/CCITT-FALSE** (poly `0x1021`, init `0xFFFF`) computed over everything
 in the packet after the magic word. It's implemented independently on both sides
-(`crc16_ccitt_update()` in `main.c`, `crc16_ccitt()` in `FFT.py`) and verified against
+(`crc16_ccitt_update()` in `main.c`, `crc16_ccitt()` in `protocol.py`) and verified against
 the standard test vector (`CRC(b"123456789") == 0x29B1`).
 
 ### Why decimation + rate self-measurement
@@ -78,7 +98,7 @@ also acts as a (weak, boxcar) anti-alias filter and reduces noise.
 
 Built with [PlatformIO](https://platformio.org/) (ESP-IDF framework).
 
-```
+```bash
 pio run                    # build
 pio run --target upload    # flash
 pio device monitor         # view logs (3,000,000 baud, see below)
@@ -111,7 +131,7 @@ it again:
 
 Requires Python 3 with:
 
-```
+```bash
 pip install numpy pyqtgraph PyQt6 pyserial PyOpenGL psutil
 ```
 
@@ -123,7 +143,7 @@ of crashing the app.
 
 Run against live hardware:
 
-```
+```bash
 python src/FFT.py --serial              # pick the port from a GUI list
 python src/FFT.py --serial COM5         # or connect directly
 python src/FFT.py --serial /dev/ttyUSB0 --baud 3000000
@@ -138,7 +158,7 @@ restarting the app from the command line.
 
 Run standalone with a synthetic test signal (no hardware needed):
 
-```
+```bash
 python src/FFT.py
 python src/FFT.py --wave chirp --freq 20 --freq2 80
 python src/FFT.py --wave sine --freq 440 --samplerate 44100
@@ -173,6 +193,14 @@ raise `--window` (e.g. `--window 16384`) and/or the sidebar's Averaging slider.
 
 **Time domain** — scrolling waveform, AC-coupled (DC bias auto-subtracted) in live
 mode with the removed bias shown separately in the readings panel.
+
+**Oscilloscope trigger** — Free Run (default), Normal, or Single-shot capture on the
+Time domain plot, with rising/falling edge selection and a draggable level line and
+pre-trigger-position marker right on the plot. Normal re-triggers continuously,
+holding each captured waveform steady until the next qualifying edge completes;
+Single captures once and freezes until re-armed. FFT and every other reading keep
+updating continuously off the live signal regardless of trigger state — only the
+Time domain trace itself freezes/re-syncs.
 
 **Frequency domain** — live spectrum with:
 - Selectable FFT window function (trades frequency resolution against
@@ -287,8 +315,9 @@ or a 2-page PDF report (readings as text on page 1, all visible plots on page 2)
 
 ## How the measurements work
 
-The formulas below are transcribed from what `src/FFT.py` actually computes (function
-names in parentheses), not generic textbook copies — variable names match the code.
+The formulas below are transcribed from what `src/FFT_Visualize/dsp.py` actually
+computes (function names in parentheses), not generic textbook copies — variable
+names match the code.
 
 ### Coherent-gain amplitude scaling
 
@@ -433,19 +462,19 @@ to make and a common one in ad hoc spectrum-analyzer code.
 
 Covered under [Wire protocol](#wire-protocol) above — poly `0x1021`, init `0xFFFF`,
 MSB-first, no reflection, no final XOR; implemented independently in `main.c` and
-`FFT.py` and cross-checked against the standard test vector.
+`protocol.py` and cross-checked against the standard test vector.
 
 ## Testing
 
-`src/FFT.py`'s DSP math (CRC, windows, peak/harmonic detection, SNR/SINAD/THD/
-ENOB, noise metrics, Cepstrum, Goertzel, Duty Cycle Analyzer) and wire protocol
-parsing are covered by a `pytest` suite in `tests/`, plus a smaller set of GUI-
-level regression tests that build a real (offscreen) window to check things
-like "every graph starts hidden" and "a hidden panel's per-frame cost stays
-near zero" -- both were real bugs during development that only a running
+`dsp.py`'s DSP math (CRC, windows, peak/harmonic detection, SNR/SINAD/THD/
+ENOB, noise metrics, Cepstrum, Goertzel, Duty Cycle Analyzer) and `protocol.py`'s
+wire protocol parsing are covered by a `pytest` suite in `tests/`, plus a smaller
+set of GUI-level regression tests that build a real (offscreen) window to check
+things like "every graph starts hidden" and "a hidden panel's per-frame cost
+stays near zero" -- both were real bugs during development that only a running
 window could catch.
 
-```
+```bash
 pip install pytest
 pytest
 ```
@@ -459,8 +488,6 @@ never the real settings a normal run persists.
   above) rather than silently wrong.
 - **Single channel**: only one ADC channel (GPIO7) is sampled; no multi-channel /
   Lissajous support yet.
-- **No trigger mode**: capture is free-running; there's no edge/level-triggered
-  single-shot capture (Pause + cursors are the closest substitute today).
 - **No auto-reconnect**: if the board resets or the USB link drops mid-session, the
   display just freezes with no automatic retry (the Link health counters will show
   the packet flow having stopped) — use **Change port...** in the sidebar to
@@ -474,11 +501,15 @@ never the real settings a normal run persists.
 
 ## Project layout
 
-```
-src/main.c        ESP-IDF firmware
-src/FFT.py        PyQt6/pyqtgraph visualizer (also the synthetic test bench)
-tests/            pytest suite for FFT.py's DSP math and wire protocol (see Testing)
-platformio.ini    PlatformIO project config (monitor_speed, board, framework)
-sdkconfig.defaults        Persisted Kconfig overrides (console UART baud/mode)
-sdkconfig.esp32-s3-devkitm-1   Generated full sdkconfig (do not hand-edit; see above)
-```
+| Path | Description |
+|---|---|
+| `src/main.c` | ESP-IDF firmware |
+| `src/FFT.py` | Thin backward-compatible launcher — `python src/FFT.py` and `import FFT` both still work; re-exports everything from `FFT_Visualize/` below |
+| `src/FFT_Visualize/dsp.py` | Pure signal-processing math (no Qt/serial dependencies) |
+| `src/FFT_Visualize/protocol.py` | Serial wire format: CRC framing, `SerialReader` |
+| `src/FFT_Visualize/ui.py` | PyQt6/pyqtgraph application (`FFTBenchWindow`, `main()`) |
+| `tests/` | pytest suite for the DSP math and wire protocol (see [Testing](#testing)) |
+| `docs/` | README assets (screenshot) |
+| `platformio.ini` | PlatformIO project config (monitor speed, board, framework) |
+| `sdkconfig.defaults` | Persisted Kconfig overrides (console UART baud/mode) |
+| `sdkconfig.esp32-s3-devkitm-1` | Generated full sdkconfig (do not hand-edit; see above) |

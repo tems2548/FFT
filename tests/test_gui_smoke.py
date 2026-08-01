@@ -12,6 +12,7 @@ normal run uses.
 import pytest
 
 import FFT
+import ui
 from PyQt6 import QtWidgets
 
 pytestmark = pytest.mark.gui
@@ -165,7 +166,7 @@ class FakeReader:
 
 
 class FakeSerialPortDialog:
-    """Stands in for FFT.SerialPortDialog -- .exec() returns Accepted
+    """Stands in for ui.SerialPortDialog -- .exec() returns Accepted
     immediately instead of showing a real (modal, blocking) dialog."""
 
     def __init__(self, _baud, parent=None):
@@ -187,7 +188,10 @@ class TestConnectToSerialPort:
 
     def test_connect_click_replaces_window_with_a_live_one(self, make_window, monkeypatch):
         win = make_window()
-        monkeypatch.setattr(FFT, "SerialPortDialog", FakeSerialPortDialog)
+        # Patched on ui, not FFT: _on_connect_click (defined in ui.py) looks
+        # up the bare name SerialPortDialog in ui.py's own module globals,
+        # not FFT.py's re-exported copy -- patching the shim wouldn't reach it.
+        monkeypatch.setattr(ui, "SerialPortDialog", FakeSerialPortDialog)
 
         assert win in FFT._window_refs
         win._on_connect_click()
@@ -211,7 +215,7 @@ class TestConnectToSerialPort:
                 return QtWidgets.QDialog.DialogCode.Rejected
 
         win = make_window()
-        monkeypatch.setattr(FFT, "SerialPortDialog", DecliningDialog)
+        monkeypatch.setattr(ui, "SerialPortDialog", DecliningDialog)
         win._on_connect_click()
         assert not win.live
         assert win in FFT._window_refs
